@@ -258,13 +258,14 @@ def editor_preserved_layout(
     )
 
     try:
-        if output_format == "vertical_split":
-            plan = detect_speaker_reframe_plan(clip_path, "vertical_split")
-            if not plan or plan.get("mode") != "split":
+        if output_format in {"vertical_split", "vertical_facecam"}:
+            plan = detect_speaker_reframe_plan(clip_path, output_format)
+            expected_mode = "facecam" if output_format == "vertical_facecam" else "split"
+            if not plan or plan.get("mode") != expected_mode:
                 return None
             return {
                 "kind": "split",
-                "output_format": "vertical_split",
+                "output_format": output_format,
                 "speaker_plan": plan,
             }
         if output_format != "vertical":
@@ -827,7 +828,7 @@ async def prepare_editor(ctx, task_id: str, clip_id: str, filename: str):
             # vertical or original crop. Bake that frame into the editor
             # source so preview and export show it. Other clips keep this
             # uncropped trim and the crop chosen below.
-            if output_format in {"vertical", "vertical_split", "vertical_fit"}:
+            if output_format in {"vertical", "vertical_split", "vertical_facecam", "vertical_fit"}:
                 from ..clip_source_map import load_clip_vertical_layout
 
                 await run_in_thread(

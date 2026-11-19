@@ -1,7 +1,7 @@
 import { isClipLength, type ClipLength } from "@/lib/clip-duration";
 import { isWorkflow, type Workflow, type WorkflowSettingValue } from "@/lib/workflows";
 
-export const OUTPUT_FORMATS = ["vertical", "vertical_fit", "vertical_pan", "vertical_split", "original"] as const;
+export const OUTPUT_FORMATS = ["vertical", "vertical_fit", "vertical_pan", "vertical_split", "vertical_facecam", "original"] as const;
 export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 export const LENGTH_WORKFLOWS = ["series", "recap", "trailer"] as const;
 export type LengthWorkflow = (typeof LENGTH_WORKFLOWS)[number];

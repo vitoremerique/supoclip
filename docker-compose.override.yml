@@ -1,0 +1,23 @@
+# Local overrides: slower budgets for running the LLM on local Ollama (GTX 1650).
+# Ollama processes one request at a time, so windows are analysed sequentially.
+x-local-llm-env: &local-llm-env
+  ANALYSIS_WINDOW_CONCURRENCY: "1"
+  TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS: "1800"
+  ANALYSIS_TOTAL_TIMEOUT_SECONDS: "9000"
+  RERANK_TIMEOUT_SECONDS: "1800"
+  # "Webcam + jogo" layout. Empty = detect the webcam automatically per clip.
+  # Fixed box as fractions of the frame: x,y,w,h (e.g. 0.78,0.09,0.21,0.22).
+  FACECAM_REGION: "${FACECAM_REGION:-}"
+  FACECAM_FACE_SCALE: "${FACECAM_FACE_SCALE:-3.8}"
+
+services:
+  worker:
+    environment: *local-llm-env
+  ai-worker:
+    environment: *local-llm-env
+  backend:
+    environment: *local-llm-env
+  frontend:
+    environment:
+      POSTADOR_URL: "${POSTADOR_URL:-http://host.docker.internal:5680}"
+      TIKTOK_HASHTAGS: "${TIKTOK_HASHTAGS:-}"

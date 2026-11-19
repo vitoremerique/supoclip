@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Tuple
 import cv2
 import numpy as np
+import os
 import re
 import shutil
 import subprocess
@@ -579,11 +580,198 @@ def build_pan_expression(
     return build_smooth_pan_expression(cleaned)
 
 
+# ---------------------------------------------------------------------------
+# Facecam + gameplay stack ("vertical_facecam")
+# ---------------------------------------------------------------------------
+# Streams usually show the streamer's webcam as a small static overlay. The
+# webcam goes on top (kept close to its own 16:9 shape so it is not over-zoomed)
+# and the centre of the gameplay fills the rest of the 1080x1920 frame.
+FACECAM_SAMPLE_FRAMES = 24
+# Webcam box width as a multiple of the detected face size, used when the
+# exact overlay is not configured. Kept small so the crop stays inside the
+# overlay instead of pulling in gameplay pixels.
+FACECAM_FACE_SCALE = float(os.getenv("FACECAM_FACE_SCALE", "3.8"))
+FACECAM_TOP_MIN_H = 480
+FACECAM_TOP_MAX_H = 960
+# Last webcam box found per source resolution. Clips of one task are cut from
+# the same stream, so a clip where detection misses reuses its neighbour's box.
+_LAST_FACECAM_BOX: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+
+
+def _configured_facecam_box(width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
+    """FACECAM_REGION="x,y,w,h" as fractions of the frame (e.g. 0.78,0.09,0.21,0.22)."""
+    raw = os.getenv("FACECAM_REGION", "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    try:
+        x, y, w, h = (float(part) for part in raw.split(","))
+    except ValueError:
+        logger.warning("Ignoring FACECAM_REGION=%r: expected four fractions x,y,w,h", raw)
+        return None
+    if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1):
+        logger.warning("Ignoring FACECAM_REGION=%r: values must be fractions of the frame", raw)
+        return None
+    bx, by = int(x * width), int(y * height)
+    return bx, by, min(int(w * width), width - bx), min(int(h * height), height - by)
+
+
+def find_static_facecam_box(
+    clip_path: Path, width: int, height: int
+) -> Optional[Tuple[int, int, int, int]]:
+    """Locate a webcam overlay as the face that stays put across the clip.
+
+    Gameplay characters move around; the streamer's face in the webcam stays
+    in the same spot. Faces are sampled across the clip, grouped by position
+    and size, and the group seen in the most frames wins. Groups centred in
+    the middle of the frame are ignored: that is where the player character is.
+    """
+    cap = cv2.VideoCapture(str(clip_path))
+    if not cap.isOpened():
+        return None
+    yunet, haar = _open_face_detectors()
+    hits: List[Tuple[int, float, float, float]] = []
+    frames_read = 0
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        duration = total / fps if total > 0 else ffprobe_duration(clip_path)
+        for index in range(FACECAM_SAMPLE_FRAMES):
+            cap.set(cv2.CAP_PROP_POS_MSEC, duration * (index + 0.5) / FACECAM_SAMPLE_FRAMES * 1000)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            frames_read += 1
+            for fx, fy, fw, fh in _detect_face_boxes(frame, yunet, haar):
+                hits.append((index, fx + fw / 2, fy + fh / 2, (fw + fh) / 2))
+    finally:
+        cap.release()
+        if yunet is not None and hasattr(yunet, "close"):
+            try:
+                yunet.close()
+            except Exception:
+                pass
+
+    def same_spot(a: Tuple[int, float, float, float], b: Tuple[int, float, float, float]) -> bool:
+        return (
+            abs(a[1] - b[1]) <= 0.35 * b[3]
+            and abs(a[2] - b[2]) <= 0.35 * b[3]
+            and 0.7 <= a[3] / max(b[3], 1.0) <= 1.4
+        )
+
+    best: List[Tuple[int, float, float, float]] = []
+    best_frames = 0
+    for anchor in hits:
+        if abs(anchor[1] - width / 2) < 0.2 * width and abs(anchor[2] - height / 2) < 0.2 * height:
+            continue
+        group = [hit for hit in hits if same_spot(hit, anchor)]
+        frames = len({hit[0] for hit in group})
+        if frames > best_frames:
+            best, best_frames = group, frames
+    needed = max(3, int(frames_read * 0.25))
+    if best_frames < needed:
+        logger.info("Facecam not found: best static face in %d/%d frames", best_frames, frames_read)
+        return None
+
+    cx = float(np.median([hit[1] for hit in best]))
+    cy = float(np.median([hit[2] for hit in best]))
+    size = float(np.median([hit[3] for hit in best]))
+    box_w = min(width, size * FACECAM_FACE_SCALE)
+    box_h = min(height, box_w * 9 / 16)
+    bx = int(max(0, min(width - box_w, cx - box_w / 2)))
+    # Face slightly below centre leaves headroom (hair, headphones).
+    by = int(max(0, min(height - box_h, cy - box_h * 0.56)))
+    logger.info(
+        "Facecam found at (%d,%d) %dx%d from a face seen in %d/%d frames",
+        bx, by, int(box_w), int(box_h), best_frames, frames_read,
+    )
+    return bx, by, int(box_w), int(box_h)
+
+
+def detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
+    """Webcam-on-top, gameplay-below plan for a landscape stream clip."""
+    width, height = ffprobe_video_size(clip_path)
+    if width / max(height, 1) <= 1.2:
+        return None
+    key = (width, height)
+    box = _configured_facecam_box(width, height) or find_static_facecam_box(clip_path, width, height)
+    if box:
+        _LAST_FACECAM_BOX[key] = box
+    else:
+        box = _LAST_FACECAM_BOX.get(key)
+        if box:
+            logger.info("Facecam reused from a previous clip: %s", box)
+    if not box:
+        return None
+
+    bx, by, bw, bh = box
+    top_h = round_to_even(int(max(FACECAM_TOP_MIN_H, min(FACECAM_TOP_MAX_H, 1080 * bh / max(bw, 1)))))
+    bottom_h = 1920 - top_h
+
+    # Trim the webcam box to the top panel's aspect, keeping it centred.
+    target = 1080 / top_h
+    if bw / max(bh, 1) > target:
+        new_w = int(bh * target)
+        bx, bw = bx + (bw - new_w) // 2, new_w
+    else:
+        new_h = int(bw / target)
+        by, bh = by + (bh - new_h) // 2, new_h
+    cam = {
+        "x": clamp_even(bx, 0, max(0, width - 2)),
+        "y": clamp_even(by, 0, max(0, height - 2)),
+        "w": round_to_even(max(2, bw)),
+        "h": round_to_even(max(2, bh)),
+    }
+    cam["w"] = min(cam["w"], round_to_even(width - cam["x"]))
+    cam["h"] = min(cam["h"], round_to_even(height - cam["y"]))
+
+    # Centre of the gameplay at the bottom panel's aspect, as tall as possible.
+    game_h = height
+    game_w = int(height * 1080 / bottom_h)
+    if game_w > width:
+        game_w = width
+        game_h = int(width * bottom_h / 1080)
+    game_w, game_h = round_to_even(game_w), round_to_even(game_h)
+    game = {
+        "x": clamp_even((width - game_w) // 2, 0, max(0, width - game_w)),
+        "y": clamp_even((height - game_h) // 2, 0, max(0, height - game_h)),
+        "w": game_w,
+        "h": game_h,
+    }
+    return {
+        "mode": "facecam",
+        "width": width,
+        "height": height,
+        "cam": cam,
+        "game": game,
+        "top_h": top_h,
+        "bottom_h": bottom_h,
+    }
+
+
+def build_facecam_stack_filter(plan: Dict[str, Any]) -> str:
+    """Filter graph (no output label) stacking the webcam over the gameplay."""
+    cam, game = plan["cam"], plan["game"]
+    return (
+        f"[0:v]split=2[cam][game];"
+        f"[cam]crop={cam['w']}:{cam['h']}:{cam['x']}:{cam['y']},"
+        f"scale=1080:{plan['top_h']}:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[camv];"
+        f"[game]crop={game['w']}:{game['h']}:{game['x']}:{game['y']},"
+        f"scale=1080:{plan['bottom_h']}:flags=lanczos,setsar=1[gamev];"
+        f"[camv][gamev]vstack,setsar=1"
+    )
+
+
 def detect_speaker_reframe_plan(
     clip_path: Path,
     output_format: str,
 ) -> Optional[Dict[str, Any]]:
     """Build a speaker-aware pan or split-screen plan for a trimmed clip."""
+    if output_format == "vertical_facecam":
+        try:
+            return detect_facecam_plan(clip_path)
+        except Exception as exc:
+            logger.warning("Facecam layout failed (%s); using the default layout", exc)
+            return None
     try:
         width, height = ffprobe_video_size(clip_path)
         if width / max(height, 1) <= 1.2:
@@ -1795,22 +1983,25 @@ def render_reframed_clip_ffmpeg(
     else:
         plan = (
             detect_speaker_reframe_plan(input_path, output_format)
-            if output_format in {"vertical_pan", "vertical_split"}
+            if output_format in {"vertical_pan", "vertical_split", "vertical_facecam"}
             else None
         )
 
-    if plan and plan["mode"] == "split":
-        left = plan["regions"]["left"]
-        right = plan["regions"]["right"]
+    if plan and plan["mode"] in {"split", "facecam"}:
         vstack_tail = f",{subs}" if subs else ""
-        stacked = (
-            f"[0:v]split=2[l][r];"
-            f"[l]crop={left['tile_w']}:{left['tile_h']}:{left['tile_x']}:{left['tile_y']},"
-            f"scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[lv];"
-            f"[r]crop={right['tile_w']}:{right['tile_h']}:{right['tile_x']}:{right['tile_y']},"
-            f"scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[rv];"
-            f"[lv][rv]vstack,setsar=1"
-        )
+        if plan["mode"] == "facecam":
+            stacked = build_facecam_stack_filter(plan)
+        else:
+            left = plan["regions"]["left"]
+            right = plan["regions"]["right"]
+            stacked = (
+                f"[0:v]split=2[l][r];"
+                f"[l]crop={left['tile_w']}:{left['tile_h']}:{left['tile_x']}:{left['tile_y']},"
+                f"scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[lv];"
+                f"[r]crop={right['tile_w']}:{right['tile_h']}:{right['tile_x']}:{right['tile_y']},"
+                f"scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[rv];"
+                f"[lv][rv]vstack,setsar=1"
+            )
         if overlays:
             return composited(f"{stacked}[base]", "[base]", 1080, 1920), 1080, 1920
         video_filter = f"{stacked}{vstack_tail}[v]"
@@ -1893,8 +2084,10 @@ def caption_probe_plan(input_path: Path, output_format: str, vertical_plan=None)
     """The same composition as the final render, without subtitles or stock footage."""
     if output_format == "vertical_fit":
         return build_full_frame_filter(), "complex"
-    if output_format in {"vertical_split", "vertical_pan"}:
+    if output_format in {"vertical_split", "vertical_pan", "vertical_facecam"}:
         plan = detect_speaker_reframe_plan(input_path, output_format)
+        if plan and plan["mode"] == "facecam":
+            return f"{build_facecam_stack_filter(plan)}[vout]", "complex"
         if plan and plan["mode"] == "split":
             left, right = plan["regions"]["left"], plan["regions"]["right"]
             return (f"[0:v]split=2[a][b];[a]crop={left['tile_w']}:{left['tile_h']}:{left['tile_x']}:{left['tile_y']},scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[top];[b]crop={right['tile_w']}:{right['tile_h']}:{right['tile_x']}:{right['tile_y']},scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[bottom];[top][bottom]vstack,setsar=1[vout]", "complex")

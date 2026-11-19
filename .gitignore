@@ -25,3 +25,14 @@ docs/youtube-provider-registry*.json
 
 # Local agent checkouts
 .claude/worktrees/
+
+# Postador do TikTok (sessao do Chrome, videos temporarios, registro)
+postador/.venv/
+postador/perfil_tiktok/
+postador/videos/
+postador/erros/
+postador/agendados.json
+postador/__pycache__/
+postador/postador.log
+build.log
+build-frontend.log

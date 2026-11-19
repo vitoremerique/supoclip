@@ -66,6 +66,10 @@
       "label": "Geteilter Bildschirm",
       "hint": "Zwei Sprecher übereinander"
     },
+    "vertical_facecam": {
+      "label": "Facecam + Gameplay",
+      "hint": "Webcam des Streamers oben, Gameplay unten"
+    },
     "original": {
       "label": "Original",
       "hint": "Seitenverhältnis der Quelle behalten"

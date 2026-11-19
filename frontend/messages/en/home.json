@@ -66,6 +66,10 @@
       "label": "Split-screen",
       "hint": "Two speakers stacked"
     },
+    "vertical_facecam": {
+      "label": "Facecam + gameplay",
+      "hint": "Streamer's webcam on top, gameplay below"
+    },
     "original": {
       "label": "Original",
       "hint": "Keep the source aspect ratio"

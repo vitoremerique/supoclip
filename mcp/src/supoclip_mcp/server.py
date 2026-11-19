@@ -90,10 +90,10 @@ def build_app(server: Optional[FastMCP] = None):
 mcp = _build_mcp()
 
 ProcessingMode = Literal["fast", "balanced", "quality"]
-OutputFormat = Literal["vertical", "vertical_fit", "vertical_pan", "vertical_split", "original"]
+OutputFormat = Literal["vertical", "vertical_fit", "vertical_pan", "vertical_split", "vertical_facecam", "original"]
 ExportPreset = Literal["tiktok", "reels", "shorts"]
 TERMINAL_STATES = {"completed", "error", "cancelled"}
-VALID_OUTPUT_FORMATS = {"vertical", "vertical_fit", "vertical_pan", "vertical_split", "original"}
+VALID_OUTPUT_FORMATS = {"vertical", "vertical_fit", "vertical_pan", "vertical_split", "vertical_facecam", "original"}
 
 # Mirrors backend/src/workflows/options.py so bad requests fail here with a clear
 # message instead of a 422 round trip. The backend stays the authority.
@@ -451,7 +451,7 @@ async def supoclip_create_clip_task(
         url: YouTube or direct video URL to clip.
         title: Optional task title.
         processing_mode: 'fast' | 'balanced' | 'quality'.
-        output_format: 'vertical' | 'vertical_fit' (full frame on 9:16) | 'vertical_pan' | 'vertical_split' | 'original'.
+        output_format: 'vertical' | 'vertical_fit' (full frame on 9:16) | 'vertical_pan' | 'vertical_split' | 'vertical_facecam' (webcam on top, gameplay below) | 'original'.
         add_subtitles: Whether to burn in subtitles.
         caption_template: Caption template id.
         include_broll: Whether to add B-roll overlays.

@@ -66,6 +66,10 @@
       "label": "Tela dividida",
       "hint": "Dois falantes, um sobre o outro"
     },
+    "vertical_facecam": {
+      "label": "Webcam + jogo",
+      "hint": "Câmera do streamer em cima, gameplay embaixo"
+    },
     "original": {
       "label": "Original",
       "hint": "Mantém a proporção do vídeo original"

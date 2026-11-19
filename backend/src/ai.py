@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, Literal
 import asyncio
 import logging
 import math
+import os
 import random
 import re
 
@@ -37,18 +38,18 @@ MIN_ACCEPTED_CLIP_SECONDS = 15
 MAX_ACCEPTED_CLIP_SECONDS = 60
 TRANSCRIPT_ANALYSIS_CACHE_VERSION = "windowed-rerank-v6"
 TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS = 3
-TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = 600
+TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = int(os.getenv("TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS", "600"))
 # Long transcripts are analysed in overlapping windows so every part of the
 # source gets the model's full attention; candidates are then reranked together.
 ANALYSIS_WINDOW_SECONDS = 12 * 60
 ANALYSIS_WINDOW_OVERLAP_SECONDS = 2 * 60
 ANALYSIS_SINGLE_WINDOW_MAX_SECONDS = 15 * 60
-ANALYSIS_WINDOW_CONCURRENCY = 3
+ANALYSIS_WINDOW_CONCURRENCY = int(os.getenv("ANALYSIS_WINDOW_CONCURRENCY", "3"))
 ANALYSIS_WINDOW_SEGMENT_TARGET = "3-5"
 # Wall-clock budget for all windows together. Each window additionally keeps
 # its own TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS budget once it starts running.
-ANALYSIS_TOTAL_TIMEOUT_SECONDS = 1800
-RERANK_TIMEOUT_SECONDS = 240
+ANALYSIS_TOTAL_TIMEOUT_SECONDS = int(os.getenv("ANALYSIS_TOTAL_TIMEOUT_SECONDS", "1800"))
+RERANK_TIMEOUT_SECONDS = int(os.getenv("RERANK_TIMEOUT_SECONDS", "240"))
 CANDIDATE_DEDUPE_OVERLAP_RATIO = 0.5
 # How far a model timestamp may sit from a transcript line boundary and still be
 # snapped onto it instead of the whole clip being dropped.

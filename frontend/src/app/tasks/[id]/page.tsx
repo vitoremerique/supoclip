@@ -6,6 +6,8 @@ import { CaptionSizeControl } from "@/components/caption-size-control";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { toast } from "sonner";
+
+import { TikTokScheduler } from "@/components/app/tiktok-scheduler";
 import { useTaskProgress } from "@/hooks/use-task-progress";
 import { StatusBadge, ACTIVE_TASK_STATUSES } from "@/components/app/status-badge";
 import { getClipUrl, requestAction, EXPORT_PRESETS } from "@/lib/clip-actions";
@@ -1041,6 +1043,7 @@ export default function TaskPage() {
             <Button asChild><Link href="/"><ArrowLeft className="size-4" />{t("tryAnother")}</Link></Button>
           </EmptyState>
         ) : isSeries ? (
+          <>
           <SeriesView
             clips={sortedClips}
             plan={plan}
@@ -1057,6 +1060,8 @@ export default function TaskPage() {
             resumeDisabled={pendingAction !== null}
             renderActions={publishButton}
           />
+          {task.status === "completed" && !readOnly ? <TikTokScheduler clips={sortedClips} /> : null}
+          </>
         ) : heroClip && SINGLE_OUTPUT.has(workflow) ? (
           <>
             <div className="mb-5 flex justify-end">{formatSelect}</div>
@@ -1106,6 +1111,7 @@ export default function TaskPage() {
             <div className="grid grid-cols-2 gap-x-4 gap-y-7 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
               {sortedClips.map(renderTile)}
             </div>
+            {task.status === "completed" && !readOnly ? <TikTokScheduler clips={sortedClips} /> : null}
           </>
         )}
       </div>

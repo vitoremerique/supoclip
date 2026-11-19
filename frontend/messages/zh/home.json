@@ -66,6 +66,10 @@
       "label": "分屏",
       "hint": "两位说话人上下排列"
     },
+    "vertical_facecam": {
+      "label": "摄像头 + 游戏画面",
+      "hint": "主播摄像头在上，游戏画面在下"
+    },
     "original": {
       "label": "原始",
       "hint": "保留源视频比例"
