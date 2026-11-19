@@ -9,6 +9,12 @@ x-local-llm-env: &local-llm-env
   # Fixed box as fractions of the frame: x,y,w,h (e.g. 0.78,0.09,0.21,0.22).
   FACECAM_REGION: "${FACECAM_REGION:-}"
   FACECAM_FACE_SCALE: "${FACECAM_FACE_SCALE:-3.8}"
+  # Dynamic camera (split / reaction / game shots) and SFX on the cuts.
+  FACECAM_DYNAMIC: "${FACECAM_DYNAMIC:-true}"
+  FACECAM_SFX: "${FACECAM_SFX:-true}"
+  FACECAM_SFX_VOLUME: "${FACECAM_SFX_VOLUME:-0.5}"
+  FACECAM_REACT_RISE_DB: "${FACECAM_REACT_RISE_DB:-8}"
+  FACECAM_GAME_MIN_MOTION: "${FACECAM_GAME_MIN_MOTION:-8}"
 
 services:
   worker:

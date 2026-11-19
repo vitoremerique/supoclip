@@ -432,6 +432,15 @@ def create_optimized_clip(
                 except Exception as exc:
                     logger.warning("Vertical layout planning failed: %s", exc)
                     caption_y = None
+            if reframe_format == "vertical_facecam":
+                # The hook banner sits on the webcam/gameplay seam of the opening.
+                try:
+                    from .media.reframing import detect_facecam_plan, facecam_hook_center_y
+                    facecam_plan = detect_facecam_plan(source_clip_path)
+                    if facecam_plan:
+                        plan_report["hook_center_y"] = facecam_hook_center_y(facecam_plan)
+                except Exception as exc:
+                    logger.warning("Facecam hook placement failed: %s", exc)
             if layout_report is not None and caption_y is not None:
                 layout_report["caption_y"] = caption_y
             if layout_report is not None and vertical_plan is not None:
@@ -487,11 +496,13 @@ def create_optimized_clip(
                 caption_layout_report=layout_report,
                 **offsets_kwargs,
                 **labels_kwargs,
-                # Only stacked interview openings move the hook title.
+                # Only stacked interview and facecam openings move the hook title.
                 **(
                     {"hook_center_y": plan_report["hook_center_y"]}
                     if plan_report.get("hook_center_y") is not None else {}
                 ),
+                # Facecam: comic banner hook on the seam (first 4 s).
+                **({"hook_balloon": True} if reframe_format == "vertical_facecam" else {}),
             ):
                 burn_ass_path = ass_path
                 fonts_dir = ass_fonts_dir(

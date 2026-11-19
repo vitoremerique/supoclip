@@ -68,7 +68,7 @@
     },
     "vertical_facecam": {
       "label": "Facecam + Gameplay",
-      "hint": "Webcam des Streamers oben, Gameplay unten"
+      "hint": "Wechselt zwischen Webcam, Reaktion und Gameplay, mit Soundeffekten"
     },
     "original": {
       "label": "Original",

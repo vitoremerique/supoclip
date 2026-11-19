@@ -1,5 +1,6 @@
 """Captions helpers for the video pipeline."""
 
+import json
 import unicodedata
 from typing import Any
 from typing import Dict
@@ -243,6 +244,11 @@ def escape_ass_text(value: str) -> str:
     )
 
 
+def hook_balloon_geometry_path(ass_path: Path) -> Path:
+    """Sidecar holding the hook banner geometry for an .ass file."""
+    return Path(ass_path).with_suffix(".balloon.json")
+
+
 def ass_font_name(font_family: Optional[str]) -> str:
     if not font_family:
         return "Arial"
@@ -399,6 +405,88 @@ def build_point_label_ass(
     return style_line, events
 
 
+# Comic-strip hook banner (facecam layout), ported from the auto-cortes project.
+BALLOON_FONT = "Montserrat Black"
+BALLOON_TEXT_PX = 74
+BALLOON_TEXT_MIN_PX = 54
+BALLOON_MAX_LINES = 2
+BALLOON_SIDE_MARGIN = 36
+
+
+def _build_balloon_hook_ass(
+    hook_title: str,
+    video_width: int,
+    video_height: int,
+    output_duration: float,
+    center_y: Optional[float],
+    balloon: Dict[str, Any],
+) -> Tuple[str, List[str]]:
+    words = [w for w in " ".join(hook_title.split()).split(" ") if w]
+    if not words:
+        return "", []
+    # Sentence case, like the viral banner: only the first letter is a capital.
+    words[0] = words[0][:1].upper() + words[0][1:]
+    max_w = video_width - 2 * BALLOON_SIDE_MARGIN
+    size = BALLOON_TEXT_PX
+    while True:
+        char_w = 0.42 * size            # measured average width of Montserrat Black
+        max_chars = max(10, int((max_w - 70) / char_w))
+        lines = _title_lines(" ".join(words), max_chars)
+        if len(lines) <= BALLOON_MAX_LINES or size <= BALLOON_TEXT_MIN_PX:
+            break
+        size -= 4
+    if len(lines) > BALLOON_MAX_LINES:
+        lines = lines[: BALLOON_MAX_LINES - 1] + [" ".join(lines[BALLOON_MAX_LINES - 1:])]
+
+    # Key words in yellow: power words and numbers, else the longest word.
+    tokens = [normalize_token(w) for w in words]
+    accent = {i for i, t in enumerate(tokens) if t and (t in POWER_WORDS or any(c.isdigit() for c in t))}
+    if not accent:
+        longest = max(range(len(words)), key=lambda i: len(tokens[i] or ""))
+        if len(tokens[longest] or "") >= 4:
+            accent = {longest}
+    white, yellow = "&H00FFFFFF", "&H0000E6FF"
+    rendered: List[str] = []
+    k = 0
+    for line in lines:
+        spans = []
+        for word in line.split():
+            colour = yellow if k in accent else white
+            spans.append(f"{{\\c{colour}&}}{escape_ass_text(word)}")
+            k += 1
+        rendered.append(" ".join(spans))
+    text = "\\N".join(rendered)
+
+    longest_chars = max(len(line) for line in lines)
+    box_w = int(min(max_w, max(min(video_width * 0.8, max_w), longest_chars * char_w + 110)))
+    box_h = int(len(lines) * size * 1.15 + 56)
+    seam = round(video_height * (center_y if center_y is not None else 0.32))
+    # A tall banner does not climb over the face: its top stays at most 90 px
+    # above the seam and the rest hangs over the gameplay.
+    y = max(seam, seam - 90 + box_h // 2)
+    x = video_width // 2
+
+    start = 0.12
+    end = min(HOOK_TITLE_SECONDS, max(HOOK_TITLE_MIN_SECONDS, output_duration - 0.25))
+    if output_duration <= HOOK_TITLE_MIN_SECONDS:
+        start, end = 0.0, max(0.5, output_duration)
+    balloon.update({"x": x, "y": y, "w": box_w, "h": box_h, "start": start, "end": end})
+
+    style_line = (
+        f"Style: Hook,{BALLOON_FONT},{size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,0,3,5,60,60,0,1"
+    )
+    pop = (
+        "\\fscx0\\fscy0\\t(0,130,\\fscx112\\fscy112)\\t(130,230,\\fscx97\\fscy97)"
+        "\\t(230,300,\\fscx100\\fscy100)"
+    )
+    tags = f"\\an5\\pos({x},{y})\\b900{pop}\\fad(0,200)"
+    events = [
+        f"Dialogue: 5,{ass_timestamp(start)},{ass_timestamp(end)},Hook,,0,0,0,,{{{tags}}}{text}"
+    ]
+    return style_line, events
+
+
 def build_hook_title_ass(
     hook_title: str,
     template: Dict[str, Any],
@@ -410,8 +498,14 @@ def build_hook_title_ass(
     position_y: Optional[float] = None,
     editor_style: Optional[Dict[str, Any]] = None,
     center_y: Optional[float] = None,
+    balloon: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[str]]:
     """Build the (style_line, dialogue_events) for a burned-in hook title.
+
+    ``balloon`` (a dict, filled in place) switches to the comic-strip banner
+    style used by the facecam layout: white Montserrat Black text with the key
+    word in yellow, centred on ``center_y`` over a red banner image. The banner
+    itself is composited by the renderer from the geometry left in ``balloon``.
 
     ``center_y`` centres the title on that output fraction instead (the seam of
     a stacked interview two-shot); ``position_y`` anchors its bottom edge.
@@ -421,6 +515,10 @@ def build_hook_title_ass(
     outline/backing for contrast, power words and numbers in the template's
     highlight colour, and a quick fade+pop entrance.
     """
+    if balloon is not None and editor_style is None:
+        return _build_balloon_hook_ass(
+            hook_title, video_width, video_height, output_duration, center_y, balloon
+        )
     uppercase = bool(template.get("uppercase"))
     title_text = hook_title.upper() if uppercase else hook_title
 
@@ -569,6 +667,7 @@ def build_assemblyai_ass_subtitles(
     center_x_override: Optional[int] = None,
     hook_editor_style: Optional[Dict[str, Any]] = None,
     hook_center_y: Optional[float] = None,
+    hook_balloon: bool = False,
     caption_placements: Optional[List[Optional[Dict[str, Any]]]] = None,
     avoid_band: Optional[Tuple[float, float]] = None,
     caption_layout_report: Optional[Dict[str, Any]] = None,
@@ -699,6 +798,7 @@ def build_assemblyai_ass_subtitles(
         output_duration = rendered_ranges_duration(keep_ranges)
     else:
         output_duration = max(0.0, clip_end - clip_start)
+    balloon_geometry: Optional[Dict[str, Any]] = {} if hook_balloon else None
     if hook_title:
         hook_style_line, hook_events = build_hook_title_ass(
             hook_title,
@@ -713,6 +813,7 @@ def build_assemblyai_ass_subtitles(
             position_y=0.94 if position_y_override is not None and position_y_override < .4 else None,
             editor_style=hook_editor_style,
             center_y=hook_center_y,
+            balloon=balloon_geometry,
         )
         hook_style_block = f"{hook_style_line}\n"
     if point_labels:
@@ -921,6 +1022,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     all_events = hook_events + events
     output_ass_path.write_text(header + "\n".join(all_events) + "\n", encoding="utf-8")
+    # The renderer composites the banner image behind the hook from this file.
+    balloon_path = hook_balloon_geometry_path(output_ass_path)
+    if balloon_geometry:
+        balloon_path.write_text(json.dumps(balloon_geometry), encoding="utf-8")
+    else:
+        balloon_path.unlink(missing_ok=True)
     logger.info(
         "Wrote ASS subtitles: %s (%d events%s)",
         output_ass_path,

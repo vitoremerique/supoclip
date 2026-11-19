@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Tuple
 import cv2
 import numpy as np
+import copy
+import json
+import math
 import os
 import re
 import shutil
@@ -593,6 +596,24 @@ FACECAM_SAMPLE_FRAMES = 24
 FACECAM_FACE_SCALE = float(os.getenv("FACECAM_FACE_SCALE", "3.8"))
 FACECAM_TOP_MIN_H = 480
 FACECAM_TOP_MAX_H = 960
+# Dynamic camera: cut between split, reaction (big webcam) and full gameplay
+# shots following the streamer's voice/motion and the on-screen action.
+FACECAM_DYNAMIC = os.getenv("FACECAM_DYNAMIC", "true").strip().lower() not in {"0", "false", "no", "off"}
+FACECAM_SFX = os.getenv("FACECAM_SFX", "true").strip().lower() not in {"0", "false", "no", "off"}
+FACECAM_SFX_VOLUME = float(os.getenv("FACECAM_SFX_VOLUME", "0.5"))
+FACECAM_REACT_TOP_H = 1152
+FACECAM_REACT_ZOOM = 1.15
+FACECAM_BIN_SECONDS = 0.5
+FACECAM_REACT_SECONDS = 2.5
+FACECAM_REACT_RISE_DB = float(os.getenv("FACECAM_REACT_RISE_DB", "8"))
+FACECAM_GAME_MIN_MOTION = float(os.getenv("FACECAM_GAME_MIN_MOTION", "8"))
+FACECAM_GAME_MAX_SECONDS = 5.0
+# The opening holds the split while the hook banner sits on its seam.
+FACECAM_INTRO_SECONDS = float(os.getenv("FACECAM_INTRO_SECONDS", "4.0"))
+HOOK_BALLOON_IMAGE = Path(os.getenv(
+    "HOOK_BALLOON_IMAGE", str(Path(__file__).resolve().parents[2] / "transitions" / "hook" / "balao_hq.png")
+))
+SFX_DIR = Path(os.getenv("SFX_DIR", str(Path(__file__).resolve().parents[2] / "transitions" / "sfx")))
 # Last webcam box found per source resolution. Clips of one task are cut from
 # the same stream, so a clip where detection misses reuses its neighbour's box.
 _LAST_FACECAM_BOX: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
@@ -687,8 +708,31 @@ def find_static_facecam_box(
     return bx, by, int(box_w), int(box_h)
 
 
+_FACECAM_PLAN_CACHE: Dict[Tuple[str, int, float], Optional[Dict[str, Any]]] = {}
+
+
 def detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
-    """Webcam-on-top, gameplay-below plan for a landscape stream clip."""
+    """Webcam-on-top, gameplay-below plan for a landscape stream clip.
+
+    Cached per file version: the caption probe and the final render ask for
+    the same clip, and the activity analysis is a full decode.
+    """
+    try:
+        stat = Path(clip_path).stat()
+        key = (str(Path(clip_path).resolve()), stat.st_size, stat.st_mtime)
+    except OSError:
+        key = None
+    if key is not None and key in _FACECAM_PLAN_CACHE:
+        return copy.deepcopy(_FACECAM_PLAN_CACHE[key])
+    plan = _detect_facecam_plan(clip_path)
+    if key is not None:
+        if len(_FACECAM_PLAN_CACHE) > 64:
+            _FACECAM_PLAN_CACHE.clear()
+        _FACECAM_PLAN_CACHE[key] = copy.deepcopy(plan)
+    return plan
+
+
+def _detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
     width, height = ffprobe_video_size(clip_path)
     if width / max(height, 1) <= 1.2:
         return None
@@ -703,62 +747,442 @@ def detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
     if not box:
         return None
 
-    bx, by, bw, bh = box
-    top_h = round_to_even(int(max(FACECAM_TOP_MIN_H, min(FACECAM_TOP_MAX_H, 1080 * bh / max(bw, 1)))))
+    top_h = round_to_even(int(max(FACECAM_TOP_MIN_H, min(FACECAM_TOP_MAX_H, 1080 * box[3] / max(box[2], 1)))))
     bottom_h = 1920 - top_h
-
-    # Trim the webcam box to the top panel's aspect, keeping it centred.
-    target = 1080 / top_h
-    if bw / max(bh, 1) > target:
-        new_w = int(bh * target)
-        bx, bw = bx + (bw - new_w) // 2, new_w
-    else:
-        new_h = int(bw / target)
-        by, bh = by + (bh - new_h) // 2, new_h
-    cam = {
-        "x": clamp_even(bx, 0, max(0, width - 2)),
-        "y": clamp_even(by, 0, max(0, height - 2)),
-        "w": round_to_even(max(2, bw)),
-        "h": round_to_even(max(2, bh)),
-    }
-    cam["w"] = min(cam["w"], round_to_even(width - cam["x"]))
-    cam["h"] = min(cam["h"], round_to_even(height - cam["y"]))
-
-    # Centre of the gameplay at the bottom panel's aspect, as tall as possible.
-    game_h = height
-    game_w = int(height * 1080 / bottom_h)
-    if game_w > width:
-        game_w = width
-        game_h = int(width * bottom_h / 1080)
-    game_w, game_h = round_to_even(game_w), round_to_even(game_h)
-    game = {
-        "x": clamp_even((width - game_w) // 2, 0, max(0, width - game_w)),
-        "y": clamp_even((height - game_h) // 2, 0, max(0, height - game_h)),
-        "w": game_w,
-        "h": game_h,
-    }
-    return {
+    plan: Dict[str, Any] = {
         "mode": "facecam",
         "width": width,
         "height": height,
-        "cam": cam,
-        "game": game,
+        "box": list(box),
+        "cam": _fit_crop(box, 1080 / top_h, width, height),
+        "game": _game_crop(1080 / bottom_h, width, height, avoid=box),
         "top_h": top_h,
         "bottom_h": bottom_h,
+        # "Reaction" shot: the webcam takes most of the frame, punched in on the face.
+        "react_cam": _fit_crop(box, 1080 / FACECAM_REACT_TOP_H, width, height, zoom=FACECAM_REACT_ZOOM),
+        "react_game": _game_crop(1080 / (1920 - FACECAM_REACT_TOP_H), width, height, avoid=box),
+        "react_top_h": FACECAM_REACT_TOP_H,
+        # "Game" shot: gameplay alone, full screen.
+        "full_game": _game_crop(1080 / 1920, width, height, avoid=box),
+        "segments": [],
     }
+    if FACECAM_DYNAMIC:
+        try:
+            plan["segments"] = plan_facecam_shots(clip_path, plan)
+        except Exception as exc:
+            logger.warning("Dynamic facecam analysis failed (%s); keeping the static split", exc)
+    return plan
+
+
+def _fit_crop(
+    box: Tuple[int, int, int, int] | List[int], aspect: float, width: int, height: int, zoom: float = 1.0
+) -> Dict[str, int]:
+    """Crop of ``box`` at ``aspect`` (w/h), centred, optionally punched in by ``zoom``."""
+    bx, by, bw, bh = box
+    cx, cy = bx + bw / 2, by + bh / 2
+    bw, bh = bw / zoom, bh / zoom
+    if bw / max(bh, 1) > aspect:
+        bw = bh * aspect
+    else:
+        bh = bw / aspect
+    w, h = round_to_even(max(2, int(bw))), round_to_even(max(2, int(bh)))
+    w, h = min(w, round_to_even(width)), min(h, round_to_even(height))
+    x = clamp_even(int(cx - w / 2), 0, max(0, width - w))
+    y = clamp_even(int(cy - h / 2), 0, max(0, height - h))
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _game_crop(
+    aspect: float, width: int, height: int, avoid: Optional[Tuple[int, int, int, int] | List[int]] = None
+) -> Dict[str, int]:
+    """Largest crop at ``aspect`` (w/h) near the centre that leaves out ``avoid``.
+
+    ``avoid`` is the webcam overlay: a wide gameplay crop would otherwise show a
+    second, tiny copy of the streamer in its corner.
+    """
+
+    def fit(x0: int, y0: int, x1: int, y1: int) -> Optional[Dict[str, int]]:
+        aw, ah = x1 - x0, y1 - y0
+        if aw <= 0 or ah <= 0:
+            return None
+        h = ah
+        w = int(h * aspect)
+        if w > aw:
+            w = aw
+            h = int(w / aspect)
+        w, h = round_to_even(w), round_to_even(h)
+        if w < 64 or h < 64:
+            return None
+        # As close to the frame centre as the region allows.
+        x = min(max(x0, (width - w) // 2), x1 - w)
+        y = min(max(y0, (height - h) // 2), y1 - h)
+        return {"x": clamp_even(x, 0, max(0, width - w)), "y": clamp_even(y, 0, max(0, height - h)), "w": w, "h": h}
+
+    full = fit(0, 0, width, height)
+    if not avoid or full is None:
+        return full or {"x": 0, "y": 0, "w": round_to_even(width), "h": round_to_even(height)}
+    bx, by, bw, bh = avoid
+    # The box is estimated from the face, so the real overlay can be a bit larger.
+    pad = int(max(12, 0.12 * max(bw, bh)))
+    ax0, ay0, ax1, ay1 = bx - pad, by - pad, bx + bw + pad, by + bh + pad
+
+    def clear(c: Dict[str, int]) -> bool:
+        return c["x"] + c["w"] <= ax0 or c["x"] >= ax1 or c["y"] + c["h"] <= ay0 or c["y"] >= ay1
+
+    if clear(full):
+        return full
+    candidates = [
+        fit(0, max(0, ay1), width, height),        # below the webcam
+        fit(0, 0, width, min(height, ay0)),        # above it
+        fit(0, 0, min(width, ax0), height),        # left of it
+        fit(max(0, ax1), 0, width, height),        # right of it
+    ]
+    candidates = [c for c in candidates if c and clear(c)]
+    if not candidates:
+        return full
+    best = max(candidates, key=lambda c: c["w"] * c["h"])
+    # Only worth it while most of the picture survives; otherwise accept the overlay.
+    return best if best["w"] * best["h"] >= 0.45 * full["w"] * full["h"] else full
+
+
+def _parse_metadata_series(path: Path, key: str) -> Tuple[List[float], List[float]]:
+    """(times, values) for one ``metadata=mode=print`` key."""
+    times: List[float] = []
+    values: List[float] = []
+    current: Optional[float] = None
+    pattern = re.compile(re.escape(key) + r"=(-?[0-9.]+|-?inf)")
+    try:
+        text = path.read_text(errors="ignore")
+    except FileNotFoundError:
+        return times, values
+    for line in text.splitlines():
+        found = re.search(r"pts_time:([0-9.]+)", line)
+        if found:
+            current = float(found.group(1))
+            continue
+        found = pattern.search(line)
+        if found and current is not None:
+            raw = found.group(1)
+            times.append(current)
+            values.append(-70.0 if "inf" in raw else float(raw))
+            current = None
+    return times, values
+
+
+def _bin_series(times: List[float], values: List[float], duration: float, step: float) -> List[float]:
+    bins = max(1, int(math.ceil(duration / step)))
+    sums = [0.0] * bins
+    counts = [0] * bins
+    for t, v in zip(times, values):
+        i = min(bins - 1, max(0, int(t / step)))
+        sums[i] += v
+        counts[i] += 1
+    out: List[float] = []
+    last = 0.0
+    for total, count in zip(sums, counts):
+        last = total / count if count else last
+        out.append(last)
+    return out
+
+
+def _zscores(values: List[float]) -> List[float]:
+    if not values:
+        return []
+    arr = np.asarray(values, dtype=float)
+    med = float(np.median(arr))
+    spread = float(np.median(np.abs(arr - med))) * 1.4826 or float(np.std(arr)) or 1.0
+    return [float(v) for v in (arr - med) / spread]
+
+
+def measure_facecam_activity(clip_path: Path, plan: Dict[str, Any]) -> Dict[str, List[float]]:
+    """Loudness, webcam motion and gameplay motion in FACECAM_BIN_SECONDS bins."""
+    duration = ffprobe_duration(clip_path)
+    scale = 480 / plan["width"]
+
+    def scaled(crop: Dict[str, int]) -> str:
+        w = max(8, round_to_even(int(crop["w"] * scale)))
+        h = max(8, round_to_even(int(crop["h"] * scale)))
+        x = round_to_even(int(crop["x"] * scale))
+        y = round_to_even(int(crop["y"] * scale))
+        return f"{w}:{h}:{x}:{y}"
+
+    with tempfile.TemporaryDirectory(prefix="supoclip_facecam_") as tmp:
+        cam_file, game_file, loud_file = (Path(tmp) / n for n in ("cam.txt", "game.txt", "loud.txt"))
+        graph = (
+            "[0:v]fps=10,scale=480:-2,split=2[a][b];"
+            f"[a]crop={scaled(plan['cam'])},format=gray,tblend=all_mode=difference,signalstats,"
+            f"metadata=mode=print:key=lavfi.signalstats.YAVG:file={ffmpeg_escape_filter_path(cam_file)}[ao];"
+            f"[b]crop={scaled(plan['full_game'])},format=gray,tblend=all_mode=difference,signalstats,"
+            f"metadata=mode=print:key=lavfi.signalstats.YAVG:file={ffmpeg_escape_filter_path(game_file)}[bo]"
+        )
+        maps = ["-map", "[ao]", "-f", "null", "-", "-map", "[bo]", "-f", "null", "-"]
+        has_audio = ffprobe_has_audio(clip_path)
+        if has_audio:
+            graph += (
+                ";[0:a]ebur128=metadata=1,"
+                f"ametadata=mode=print:key=lavfi.r128.M:file={ffmpeg_escape_filter_path(loud_file)}[lo]"
+            )
+            maps += ["-map", "[lo]", "-f", "null", "-"]
+        result = run_ffmpeg_command(["ffmpeg", "-y", "-i", str(clip_path), "-filter_complex", graph, *maps], timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError("activity analysis ffmpeg pass failed")
+        step = FACECAM_BIN_SECONDS
+        cam = _bin_series(*_parse_metadata_series(cam_file, "lavfi.signalstats.YAVG"), duration, step)
+        game = _bin_series(*_parse_metadata_series(game_file, "lavfi.signalstats.YAVG"), duration, step)
+        loud = (
+            _bin_series(*_parse_metadata_series(loud_file, "lavfi.r128.M"), duration, step)
+            if has_audio
+            else [-70.0] * len(cam)
+        )
+    n = min(len(cam), len(game), len(loud))
+    return {"duration": [duration], "cam": cam[:n], "game": game[:n], "loud": loud[:n]}
+
+
+def plan_facecam_shots(clip_path: Path, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Shot list (start, end, kind) cutting between split, reaction and game shots.
+
+    * reaction: the streamer gets loud or moves a lot (scream, laugh, jump scare)
+    * game: busy gameplay while the streamer is fairly quiet
+    * split: everything else
+    Short shots are merged away so the cuts stay readable.
+    """
+    activity = measure_facecam_activity(clip_path, plan)
+    duration = activity["duration"][0]
+    loud, cam, game = activity["loud"], activity["cam"], activity["game"]
+    if len(loud) < 4:
+        return [{"start": 0.0, "end": duration, "kind": "split"}]
+    step = FACECAM_BIN_SECONDS
+    n = len(loud)
+    loud_med = float(np.median(loud))
+    z_cam = _zscores(cam)
+    labels = ["split"] * n
+
+    # Reaction = a sudden jump in the streamer's voice (scream, laugh, scare),
+    # not loud talking in general: compare with the second before it.
+    react_len = int(round(FACECAM_REACT_SECONDS / step))
+    lead = int(round(0.5 / step))
+    i = 2
+    while i < n:
+        before = float(np.mean(loud[max(0, i - 3):i - 1])) if i >= 2 else loud_med
+        rise = loud[i] - before
+        if (rise >= FACECAM_REACT_RISE_DB and loud[i] >= loud_med + 8.0) or (
+            rise >= FACECAM_REACT_RISE_DB - 3 and loud[i] >= loud_med + 6.0 and z_cam[i] >= 2.0
+        ):
+            for j in range(max(0, i - lead), min(n, i - lead + react_len)):
+                labels[j] = "react"
+            i += react_len + int(round(2.0 / step))   # breathing room before the next one
+            continue
+        i += 1
+
+    # Game = intense, sustained action on screen outside reactions.
+    window = int(round(2.0 / step))
+    smooth = [float(np.mean(game[max(0, k - window // 2):k + window // 2 + 1])) for k in range(n)]
+    floor = max(FACECAM_GAME_MIN_MOTION, float(np.percentile(smooth, 65)))
+    max_game = int(round(FACECAM_GAME_MAX_SECONDS / step))
+    run = cooldown = 0
+    for k in range(n):
+        if cooldown:
+            # After a capped game shot, show the split again for a while.
+            cooldown -= 1
+            run = 0
+            continue
+        if labels[k] == "split" and smooth[k] >= floor:
+            labels[k] = "game"
+            run += 1
+            if run >= max_game:
+                run, cooldown = 0, int(round(2.5 / step))
+        else:
+            run = 0
+
+    # Variety on calm clips: give the strongest gameplay moment its own shot.
+    if duration >= 12 and all(label == "split" for label in labels):
+        width = int(round(3.0 / step))
+        best = max(range(n - width + 1), key=lambda k: sum(game[k:k + width]), default=None)
+        if best is not None and sum(game[best:best + width]) / width >= FACECAM_GAME_MIN_MOTION / 2:
+            for j in range(best, best + width):
+                labels[j] = "game"
+
+    for j in range(min(n, int(round(FACECAM_INTRO_SECONDS / step)))):
+        labels[j] = "split"
+
+    runs: List[List[Any]] = []
+    for i, label in enumerate(labels):
+        if runs and runs[-1][0] == label:
+            runs[-1][2] = i + 1
+        else:
+            runs.append([label, i, i + 1])
+    min_bins = {"react": int(round(1.5 / step)), "game": int(round(2.0 / step)), "split": int(round(2.0 / step))}
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for idx, (label, a, b) in enumerate(runs):
+            if b - a >= min_bins[label]:
+                continue
+            if idx == 0:
+                target = 1
+            elif idx == len(runs) - 1:
+                target = idx - 1
+            else:
+                target = idx - 1 if runs[idx - 1][2] - runs[idx - 1][1] >= runs[idx + 1][2] - runs[idx + 1][1] else idx + 1
+            if target < idx:
+                runs[target][2] = b
+            else:
+                runs[target][1] = a
+            del runs[idx]
+            merged: List[List[Any]] = []
+            for run in runs:
+                if merged and merged[-1][0] == run[0]:
+                    merged[-1][2] = run[2]
+                else:
+                    merged.append(run)
+            runs = merged
+            changed = True
+            break
+
+    shots = [
+        {"start": round(a * step, 3), "end": round(min(duration, b * step), 3), "kind": label}
+        for label, a, b in runs
+    ]
+    shots[0]["start"] = 0.0
+    shots[-1]["end"] = round(duration, 3)
+    logger.info("Facecam shots: %s", [(s["kind"], s["start"], s["end"]) for s in shots])
+    return shots
+
+
+def facecam_hook_center_y(plan: Dict[str, Any]) -> float:
+    """Output fraction of the webcam/gameplay seam in the opening shot."""
+    shots = plan.get("segments") or []
+    kind = shots[0]["kind"] if shots else "split"
+    if kind == "react":
+        return plan["react_top_h"] / 1920
+    if kind == "game":
+        return 0.32
+    return plan["top_h"] / 1920
+
+
+def build_hook_balloon_filter(base: str, geometry: Dict[str, Any], out: str) -> str:
+    """Overlay the comic banner image behind the hook (``base`` -> ``out`` labels).
+
+    The banner pops in (0 -> 112% -> 97% -> 100%, like the text) and fades out
+    with it. The image stream is trimmed at the end so it costs nothing after.
+    """
+    w, h = round_to_even(int(geometry["w"])), round_to_even(int(geometry["h"]))
+    cx, cy = int(geometry["x"]), int(geometry["y"])
+    start, end = float(geometry["start"]), float(geometry["end"])
+    rel = f"(t-{start:.3f})"
+    pop = (
+        f"if(lt({rel},0.13),max(0.02,1.12*{rel}/0.13),"
+        f"if(lt({rel},0.23),1.12-0.15*({rel}-0.13)/0.10,"
+        f"if(lt({rel},0.30),0.97+0.03*({rel}-0.23)/0.07,1)))"
+    )
+    image = ffmpeg_escape_filter_path(HOOK_BALLOON_IMAGE)
+    return (
+        f"movie={image}:loop=0,setpts=N/30/TB,trim=end={end + 0.05:.3f},format=rgba,"
+        f"scale=w='max(2,trunc({w}*{pop}/2)*2)':h='max(2,trunc({h}*{pop}/2)*2)':eval=frame,"
+        f"fade=t=out:st={max(start, end - 0.2):.3f}:d=0.2:alpha=1[hookbal];"
+        f"[{base}][hookbal]overlay=x='{cx}-w/2':y='{cy}-h/2':eval=frame:eof_action=pass:"
+        f"enable='between(t,{start:.3f},{end:.3f})'[{out}]"
+    )
+
+
+def _load_hook_balloon(ass_path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    """Banner geometry the caption builder left beside the .ass, if any."""
+    if not ass_path or not HOOK_BALLOON_IMAGE.is_file():
+        return None
+    from .captions import hook_balloon_geometry_path
+    try:
+        geometry = json.loads(hook_balloon_geometry_path(Path(ass_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    required = {"x", "y", "w", "h", "start", "end"}
+    return geometry if isinstance(geometry, dict) and required <= geometry.keys() else None
+
+
+def _crop(c: Dict[str, int]) -> str:
+    return f"crop={c['w']}:{c['h']}:{c['x']}:{c['y']}"
+
+
+def _facecam_shot_chain(plan: Dict[str, Any], kind: str, src: str, out: str, i: int) -> str:
+    """One shot of the dynamic layout, from ``src`` to a 1080x1920 ``out``."""
+    tail = "format=yuv420p,setsar=1"
+    if kind == "game":
+        g = plan["full_game"]
+        return f"[{src}]{_crop(g)},scale=1080:1920:flags=lanczos,{tail}[{out}]"
+    if kind == "react":
+        cam, game, top = plan["react_cam"], plan["react_game"], plan["react_top_h"]
+    else:
+        cam, game, top = plan["cam"], plan["game"], plan["top_h"]
+    return (
+        f"[{src}]split=2[c{i}][g{i}];"
+        f"[c{i}]{_crop(cam)},scale=1080:{top}:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[ct{i}];"
+        f"[g{i}]{_crop(game)},scale=1080:{1920 - top}:flags=lanczos,setsar=1[gt{i}];"
+        f"[ct{i}][gt{i}]vstack,{tail}[{out}]"
+    )
 
 
 def build_facecam_stack_filter(plan: Dict[str, Any]) -> str:
-    """Filter graph (no output label) stacking the webcam over the gameplay."""
-    cam, game = plan["cam"], plan["game"]
-    return (
-        f"[0:v]split=2[cam][game];"
-        f"[cam]crop={cam['w']}:{cam['h']}:{cam['x']}:{cam['y']},"
-        f"scale=1080:{plan['top_h']}:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[camv];"
-        f"[game]crop={game['w']}:{game['h']}:{game['x']}:{game['y']},"
-        f"scale=1080:{plan['bottom_h']}:flags=lanczos,setsar=1[gamev];"
-        f"[camv][gamev]vstack,setsar=1"
+    """Filter graph (no output label): webcam over gameplay, cutting between shots."""
+    shots = plan.get("segments") or []
+    if len(shots) <= 1:
+        kind = shots[0]["kind"] if shots else "split"
+        return _facecam_shot_chain(plan, kind, "0:v", "fc", 0).rsplit("[fc]", 1)[0]
+    labels = "".join(f"[s{i}]" for i in range(len(shots)))
+    parts = [f"[0:v]split={len(shots)}{labels}"]
+    for i, shot in enumerate(shots):
+        end = "" if i == len(shots) - 1 else f":end={shot['end']:.3f}"
+        parts.append(f"[s{i}]trim=start={shot['start']:.3f}{end},setpts=PTS-STARTPTS[t{i}]")
+        parts.append(_facecam_shot_chain(plan, shot["kind"], f"t{i}", f"v{i}", i))
+    parts.append("".join(f"[v{i}]" for i in range(len(shots))) + f"concat=n={len(shots)}:v=1:a=0")
+    return ";".join(parts)
+
+
+def mix_transition_sfx(clip_path: Path, shots: List[Dict[str, Any]]) -> Optional[Path]:
+    """Copy of the clip with a whoosh/impact under each cut (video stream copied).
+
+    Returns a temporary .mkv (lossless PCM audio) or None when there is nothing
+    to add or the mix fails. The caller deletes its parent directory.
+    """
+    if not FACECAM_SFX or len(shots) <= 1:
+        return None
+    events: List[Tuple[Path, float]] = []
+    for prev, shot in zip(shots, shots[1:]):
+        cut = shot["start"]
+        if shot["kind"] == "react":
+            events.append((SFX_DIR / "impact.wav", max(0.0, cut - 0.03)))
+            events.append((SFX_DIR / "swish.wav", max(0.0, cut - 0.18)))
+        else:
+            # The whoosh peaks ~0.34 s in: line the peak up with the cut.
+            events.append((SFX_DIR / "whoosh.wav", max(0.0, cut - 0.34)))
+    events = [(path, at) for path, at in events if path.is_file()]
+    if not events:
+        logger.info("No SFX files in %s; cutting without sound effects", SFX_DIR)
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="supoclip_sfx_"))
+    out = tmp / "with_sfx.mkv"
+    inputs: List[str] = []
+    chains: List[str] = []
+    for k, (path, at) in enumerate(events, start=1):
+        inputs += ["-i", str(path)]
+        ms = int(at * 1000)
+        chains.append(f"[{k}:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={ms}|{ms},volume={FACECAM_SFX_VOLUME}[x{k}]")
+    mix = "".join(f"[x{k}]" for k in range(1, len(events) + 1))
+    graph = (
+        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo[main];"
+        + ";".join(chains)
+        + f";[main]{mix}amix=inputs={len(events) + 1}:duration=first:normalize=0[a]"
     )
+    command = [
+        "ffmpeg", "-y", "-i", str(clip_path), *inputs,
+        "-filter_complex", graph,
+        "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "pcm_s16le",
+        str(out),
+    ]
+    if run_ffmpeg_command(command, timeout=600).returncode != 0 or not out.is_file():
+        shutil.rmtree(tmp, ignore_errors=True)
+        logger.warning("SFX mix failed; rendering without sound effects")
+        return None
+    logger.info("Added %d transition SFX", len(events))
+    return out
 
 
 def detect_speaker_reframe_plan(
@@ -1991,6 +2415,11 @@ def render_reframed_clip_ffmpeg(
         vstack_tail = f",{subs}" if subs else ""
         if plan["mode"] == "facecam":
             stacked = build_facecam_stack_filter(plan)
+            balloon = _load_hook_balloon(subtitle_ass_path)
+            if balloon is not None:
+                # Banner goes over the picture and under the burned subtitles.
+                hook = build_hook_balloon_filter("fcbase", balloon, "fchook")
+                stacked = f"{stacked}[fcbase];{hook};[fchook]null"
         else:
             left = plan["regions"]["left"]
             right = plan["regions"]["right"]
@@ -2002,19 +2431,32 @@ def render_reframed_clip_ffmpeg(
                 f"scale=1080:960:flags=lanczos,{UPSCALE_SHARPEN_FILTER},setsar=1[rv];"
                 f"[lv][rv]vstack,setsar=1"
             )
-        if overlays:
-            return composited(f"{stacked}[base]", "[base]", 1080, 1920), 1080, 1920
-        video_filter = f"{stacked}{vstack_tail}[v]"
-        command = [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-filter_complex", video_filter,
-            "-map", "[v]", "-map", "0:a?",
-            *build_final_video_encode_args(),
-            *audio_args,
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
-        return run_ffmpeg_command(command).returncode == 0, 1080, 1920
+        # Dynamic facecam cuts get a whoosh/impact under each cut. The mix is a
+        # temporary copy (video stream copied, PCM audio) used as the input.
+        sfx_source = (
+            mix_transition_sfx(input_path, plan.get("segments") or [])
+            if plan["mode"] == "facecam" and has_audio
+            else None
+        )
+        if sfx_source is not None:
+            input_path = sfx_source
+        try:
+            if overlays:
+                return composited(f"{stacked}[base]", "[base]", 1080, 1920), 1080, 1920
+            video_filter = f"{stacked}{vstack_tail}[v]"
+            command = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-filter_complex", video_filter,
+                "-map", "[v]", "-map", "0:a?",
+                *build_final_video_encode_args(),
+                *audio_args,
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+            return run_ffmpeg_command(command).returncode == 0, 1080, 1920
+        finally:
+            if sfx_source is not None:
+                shutil.rmtree(sfx_source.parent, ignore_errors=True)
 
     if plan and plan["mode"] == "pan":
         video_filter = (

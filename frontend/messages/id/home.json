@@ -68,7 +68,7 @@
     },
     "vertical_facecam": {
       "label": "Facecam + gameplay",
-      "hint": "Webcam streamer di atas, gameplay di bawah"
+      "hint": "Berganti antara webcam, reaksi, dan gameplay, dengan efek suara"
     },
     "original": {
       "label": "Asli",
