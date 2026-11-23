@@ -349,5 +349,19 @@
       "relaxed": "Permitidos",
       "question": "Uma pergunta"
     }
+  },
+  "liveChat": {
+    "chip": "Chat da live",
+    "title": "Analisar o chat da live",
+    "body": "Anexe o chat exportado (.json ou .txt). Os picos de risadas, hype e pedidos de clip ajudam a IA a achar os melhores cortes, junto com a transcrição.",
+    "file": "Arquivo do chat",
+    "choose": "Escolher arquivo",
+    "remove": "Remover",
+    "offset": "Onde este vídeo começa no chat",
+    "offsetHint": "0 se o vídeo é a live inteira. Para uma parte, o horário da live em que ela começa (ex.: 2:00:00).",
+    "offsetInvalid": "Use um horário como 2:00:00 ou segundos.",
+    "formats": "Aceita: JSON do TwitchDownloader, live_chat.json do yt-dlp, JSON do chat-downloader, ou .txt com linhas \"[0:12:34] usuario: mensagem\".",
+    "uploading": "Enviando o chat...",
+    "attached": "Chat anexado"
   }
 }

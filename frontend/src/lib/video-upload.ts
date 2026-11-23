@@ -131,9 +131,43 @@ async function requestUploadAuthorization(file: File): Promise<UploadAuthorizati
   return response.json() as Promise<UploadAuthorization>;
 }
 
+/** Bytes of the file sent so far. */
+export type UploadProgressHandler = (loaded: number, total: number) => void;
+
+/**
+ * POST a form and report how much of the body has been sent. fetch() cannot
+ * report upload progress, so this uses XMLHttpRequest and hands back a
+ * Response so callers keep the same error handling.
+ */
+function postFormWithProgress(
+  url: string,
+  body: FormData,
+  headers: Record<string, string>,
+  onProgress: UploadProgressHandler,
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded, event.total);
+    };
+    xhr.onload = () => {
+      resolve(new Response(xhr.responseText, {
+        status: xhr.status,
+        headers: { "Content-Type": xhr.getResponseHeader("Content-Type") || "application/json" },
+      }));
+    };
+    xhr.onerror = () => reject(new TypeError("Failed to fetch"));
+    xhr.onabort = () => reject(new DOMException("Upload aborted", "AbortError"));
+    xhr.send(body);
+  });
+}
+
 export async function uploadVideoFile(
   file: File,
   maxBytes: number = maxVideoUploadBytes(),
+  onProgress?: UploadProgressHandler,
 ): Promise<string> {
   if (file.size > maxBytes) {
     throw new Error(uploadTooLargeMessage(maxBytes, file.size));
@@ -141,20 +175,22 @@ export async function uploadVideoFile(
 
   const uploadAuthorization = await requestUploadAuthorization(file);
   if ("storage" in uploadAuthorization) {
-    return uploadVideoFileToS3(file, uploadAuthorization);
+    return uploadVideoFileToS3(file, uploadAuthorization, onProgress);
   }
   if (!uploadAuthorization.directUpload) {
-    return uploadVideoFileViaProxy(file, maxBytes);
+    return uploadVideoFileViaProxy(file, maxBytes, onProgress);
   }
 
   const formData = new FormData();
   formData.append("video", file);
 
-  const uploadResponse = await fetch(uploadAuthorization.uploadUrl, {
-    method: "POST",
-    headers: uploadAuthorization.headers,
-    body: formData,
-  });
+  const uploadResponse = onProgress
+    ? await postFormWithProgress(uploadAuthorization.uploadUrl, formData, uploadAuthorization.headers, onProgress)
+    : await fetch(uploadAuthorization.uploadUrl, {
+        method: "POST",
+        headers: uploadAuthorization.headers,
+        body: formData,
+      });
 
   if (!uploadResponse.ok) {
     const fallbackMessage =
@@ -173,8 +209,13 @@ export async function uploadVideoFile(
   return uploadResult.video_path;
 }
 
-async function uploadVideoFileToS3(file: File, authorization: S3UploadAuthorization): Promise<string> {
+async function uploadVideoFileToS3(
+  file: File,
+  authorization: S3UploadAuthorization,
+  onProgress?: UploadProgressHandler,
+): Promise<string> {
   const completedParts: { partNumber: number; etag: string }[] = [];
+  let sentBytes = 0;
   const controller = new AbortController();
   const payload = { video_path: authorization.video_path, uploadId: authorization.uploadId };
   let nextPart = 0;
@@ -220,6 +261,8 @@ async function uploadVideoFileToS3(file: File, authorization: S3UploadAuthorizat
           throw new Error("Video upload failed. Please try again.");
         }
         completedParts.push({ partNumber: part.partNumber, etag });
+        sentBytes += Math.min(file.size, start + authorization.partSize) - start;
+        onProgress?.(sentBytes, file.size);
       } catch (error) {
         failure ??= error;
         controller.abort();
@@ -264,14 +307,17 @@ async function uploadVideoFileToS3(file: File, authorization: S3UploadAuthorizat
 export async function uploadVideoFileViaProxy(
   file: File,
   maxBytes: number = maxVideoUploadBytes(),
+  onProgress?: UploadProgressHandler,
 ): Promise<string> {
   const formData = new FormData();
   formData.append("video", file);
 
-  const uploadResponse = await fetch("/api/upload", {
-    method: "POST",
-    body: formData,
-  });
+  const uploadResponse = onProgress
+    ? await postFormWithProgress("/api/upload", formData, {}, onProgress)
+    : await fetch("/api/upload", {
+        method: "POST",
+        body: formData,
+      });
 
   if (!uploadResponse.ok) {
     const fallbackMessage =

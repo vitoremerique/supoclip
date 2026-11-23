@@ -594,6 +594,7 @@ FACECAM_SAMPLE_FRAMES = 24
 # exact overlay is not configured. Kept small so the crop stays inside the
 # overlay instead of pulling in gameplay pixels.
 FACECAM_FACE_SCALE = float(os.getenv("FACECAM_FACE_SCALE", "3.8"))
+FACECAM_MAX_FACE_FRACTION = float(os.getenv("FACECAM_MAX_FACE_FRACTION", "0.16"))
 FACECAM_TOP_MIN_H = 480
 FACECAM_TOP_MAX_H = 960
 # Dynamic camera: cut between split, reaction (big webcam) and full gameplay
@@ -637,7 +638,11 @@ def _configured_facecam_box(width: int, height: int) -> Optional[Tuple[int, int,
 
 
 def find_static_facecam_box(
-    clip_path: Path, width: int, height: int
+    clip_path: Path,
+    width: int,
+    height: int,
+    samples: int = FACECAM_SAMPLE_FRAMES,
+    min_share: float = 0.25,
 ) -> Optional[Tuple[int, int, int, int]]:
     """Locate a webcam overlay as the face that stays put across the clip.
 
@@ -656,8 +661,8 @@ def find_static_facecam_box(
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
         duration = total / fps if total > 0 else ffprobe_duration(clip_path)
-        for index in range(FACECAM_SAMPLE_FRAMES):
-            cap.set(cv2.CAP_PROP_POS_MSEC, duration * (index + 0.5) / FACECAM_SAMPLE_FRAMES * 1000)
+        for index in range(samples):
+            cap.set(cv2.CAP_PROP_POS_MSEC, duration * (index + 0.5) / samples * 1000)
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
@@ -684,11 +689,15 @@ def find_static_facecam_box(
     for anchor in hits:
         if abs(anchor[1] - width / 2) < 0.2 * width and abs(anchor[2] - height / 2) < 0.2 * height:
             continue
+        # A webcam overlay is a small corner box. A face this big is a
+        # character in a cutscene, which can hold still just as long.
+        if anchor[3] > FACECAM_MAX_FACE_FRACTION * height:
+            continue
         group = [hit for hit in hits if same_spot(hit, anchor)]
         frames = len({hit[0] for hit in group})
         if frames > best_frames:
             best, best_frames = group, frames
-    needed = max(3, int(frames_read * 0.25))
+    needed = max(3, int(frames_read * min_share))
     if best_frames < needed:
         logger.info("Facecam not found: best static face in %d/%d frames", best_frames, frames_read)
         return None
@@ -709,6 +718,35 @@ def find_static_facecam_box(
 
 
 _FACECAM_PLAN_CACHE: Dict[Tuple[str, int, float], Optional[Dict[str, Any]]] = {}
+# Webcam box of the stream being rendered, found once over the whole source.
+_STREAM_FACECAM_BOX: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+FACECAM_STREAM_SAMPLES = 72
+
+
+def prime_stream_facecam(source_path: Path) -> Optional[Tuple[int, int, int, int]]:
+    """Find the webcam once over the whole source and use it for every clip.
+
+    A cutscene can hold a character's face still for a whole clip, but only the
+    webcam stays in one place across hours of stream. Call before rendering a
+    task's clips; the box replaces per-clip detection for that resolution.
+    """
+    _STREAM_FACECAM_BOX.clear()
+    try:
+        width, height = ffprobe_video_size(source_path)
+    except Exception:
+        return None
+    if width / max(height, 1) <= 1.2:
+        return None
+    box = _configured_facecam_box(width, height) or find_static_facecam_box(
+        source_path, width, height, samples=FACECAM_STREAM_SAMPLES, min_share=0.35
+    )
+    if box:
+        _STREAM_FACECAM_BOX[(width, height)] = box
+        _FACECAM_PLAN_CACHE.clear()
+        logger.info("Stream webcam box: %s", box)
+    else:
+        logger.info("No stream-wide webcam found; clips detect their own")
+    return box
 
 
 def detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
@@ -737,7 +775,11 @@ def _detect_facecam_plan(clip_path: Path) -> Optional[Dict[str, Any]]:
     if width / max(height, 1) <= 1.2:
         return None
     key = (width, height)
-    box = _configured_facecam_box(width, height) or find_static_facecam_box(clip_path, width, height)
+    box = (
+        _configured_facecam_box(width, height)
+        or _STREAM_FACECAM_BOX.get(key)
+        or find_static_facecam_box(clip_path, width, height)
+    )
     if box:
         _LAST_FACECAM_BOX[key] = box
     else:

@@ -66,7 +66,8 @@ from ..clip_source_map import (
     save_clip_broll,
     save_clip_source_ranges,
 )
-from ..ai import get_most_relevant_parts_by_transcript, max_final_clips_for_duration
+from ..ai import get_most_relevant_parts_by_transcript, max_final_clips_for_duration, sanitize_hook_title
+from ..chat_signals import chat_heat_for_segment
 from ..clip_openings import OPENING_HOOK_PENALTY, opening_text_issue, review_opening
 from ..clip_duration import clip_duration
 from ..config import get_config
@@ -831,6 +832,7 @@ class VideoService:
         performance_context: Optional[str] = None,
         clip_length: str = "auto",
         instructions: Optional[str] = None,
+        chat_profile: Any = None,
     ) -> Any:
         """
         Analyze transcript with AI to find relevant segments.
@@ -846,6 +848,7 @@ class VideoService:
             clip_length=clip_length,
             include_reserve=True,
             **({"instructions": instructions} if instructions else {}),
+            **({"chat_profile": chat_profile} if chat_profile is not None else {}),
         )
         logger.info(
             f"AI analysis complete: {len(relevant_parts.most_relevant_segments)} segments found"
@@ -1169,6 +1172,7 @@ class VideoService:
         save_checkpoint: Callable[[Dict[str, Any]], Awaitable[None]],
         instructions: Optional[str] = None,
         max_clips: Optional[int] = None,
+        chat_profile: Any = None,
     ) -> tuple[Any, List[Dict[str, Any]], int, bool]:
         """Pick standalone highlights: (analysis, ranked segments with reserve, clip limit, final plan).
 
@@ -1231,6 +1235,7 @@ class VideoService:
                 performance_context=performance_context,
                 clip_length=clip_length,
                 **({"instructions": instructions} if instructions else {}),
+                **({"chat_profile": chat_profile} if chat_profile is not None else {}),
             )
 
         await save_checkpoint({"analysis": {
@@ -1297,7 +1302,25 @@ class VideoService:
                 segment_payload,
                 transcript_data,
             )
+            if chat_profile is not None:
+                segment_payload["chat"] = chat_heat_for_segment(chat_profile, segment_payload)
             segments_json.append(segment_payload)
+
+        if not prepared_segments:
+            # OUTPUT_LANGUAGE: hook titles (burned in and used as the post caption)
+            # follow the output language when the speech is in another one.
+            try:
+                from ..translation import needs_translation, translate_lines
+
+                if needs_translation((transcript_data or {}).get("language_code")):
+                    indexed = [(i, s["hook_title"]) for i, s in enumerate(segments_json) if s.get("hook_title")]
+                    if indexed:
+                        translated = await translate_lines([title for _, title in indexed])
+                        for (i, _), title in zip(indexed, translated):
+                            segments_json[i]["hook_title"] = sanitize_hook_title(title) or segments_json[i]["hook_title"]
+                        logger.info("Hook titles translated: %d", len(indexed))
+            except Exception:
+                logger.exception("Hook title translation failed; keeping the original titles")
 
         try:
             if not prepared_segments:
@@ -1361,6 +1384,7 @@ class VideoService:
         plan_cache: Optional[PlanCache] = None,
         outline_cache_key: Optional[str] = None,
         cleanup_settings: Optional[Dict[str, Any]] = None,
+        chat_profile: Any = None,
     ) -> Dict[str, Any]:
         """
         Complete video processing pipeline.
@@ -1604,6 +1628,7 @@ class VideoService:
                     save_checkpoint=save_checkpoint,
                     **({"instructions": instructions} if instructions else {}),
                     **({"max_clips": requested_clips} if requested_clips is not None else {}),
+                    **({"chat_profile": chat_profile} if chat_profile is not None else {}),
                 )
             else:
                 if should_cancel and await should_cancel():

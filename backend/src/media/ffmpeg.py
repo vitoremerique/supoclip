@@ -9,6 +9,7 @@ from typing import Tuple
 from ..clip_source_map import normalize_source_ranges
 from ..config import get_config
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -36,8 +37,91 @@ def clamp_even(value: int, minimum: int, maximum: int) -> int:
     return round_to_even(max(minimum, min(value, maximum)))
 
 
+_NVENC_OK: Optional[bool] = None
+
+
+def nvenc_available() -> bool:
+    """Whether H.264 encodes can go to the GPU (VIDEO_ENCODER=cpu turns it off).
+
+    Probed once per process with a tiny encode, so a container without the
+    NVIDIA video libraries silently keeps libx264.
+    """
+    global _NVENC_OK
+    if os.getenv("VIDEO_ENCODER", "auto").strip().lower() in {"cpu", "libx264", "x264"}:
+        return False
+    if _NVENC_OK is None:
+        try:
+            probe = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=256x256:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60,
+            )
+            _NVENC_OK = probe.returncode == 0
+        except Exception:
+            _NVENC_OK = False
+        logger.info("GPU video encoding (NVENC): %s", "on" if _NVENC_OK else "off")
+    return _NVENC_OK
+
+
+def _nvenc_command(command: List[str]) -> Optional[List[str]]:
+    """The same command with libx264 swapped for h264_nvenc (None if no libx264).
+
+    CRF maps to a constant-quality target two steps higher (x264 CRF 19 looks
+    like NVENC CQ 21); x264-only options are dropped and keyint becomes -g.
+    """
+    if "libx264" not in command:
+        return None
+    out: List[str] = []
+    crf: Optional[float] = None
+    gop: Optional[str] = None
+    index = 0
+    while index < len(command):
+        arg = command[index]
+        nxt = command[index + 1] if index + 1 < len(command) else None
+        if arg in ("-c:v", "-vcodec", "-codec:v") and nxt == "libx264":
+            out += ["-c:v", "h264_nvenc"]
+            index += 2
+            continue
+        if arg in ("-preset", "-tune") and nxt is not None:
+            index += 2
+            continue
+        if arg == "-crf" and nxt is not None:
+            try:
+                crf = float(nxt)
+            except ValueError:
+                pass
+            index += 2
+            continue
+        if arg in ("-x264-params", "-x264opts") and nxt is not None:
+            match = re.search(r"keyint=(\d+)", nxt)
+            gop = match.group(1) if match else None
+            index += 2
+            continue
+        out.append(arg)
+        index += 1
+    if "h264_nvenc" not in out:
+        return None
+    cq = str(int(round((crf if crf is not None else 20) + 2)))
+    position = out.index("h264_nvenc") + 1
+    out[position:position] = [
+        "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+        "-spatial-aq", "1", *(["-g", gop] if gop else []),
+    ]
+    return out
+
+
 def run_ffmpeg_command(command: List[str], timeout: int = 900) -> subprocess.CompletedProcess:
-    """Run ffmpeg/ffprobe and log stderr on failure."""
+    """Run ffmpeg/ffprobe and log stderr on failure.
+
+    H.264 encodes run on the GPU (NVENC) when available; if that fails the
+    original libx264 command runs, so the GPU never costs a clip.
+    """
+    gpu_command = _nvenc_command(command) if command and command[0] == "ffmpeg" else None
+    if gpu_command and nvenc_available():
+        result = subprocess.run(gpu_command, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return result
+        logger.warning("NVENC encode failed; retrying on the CPU: %s", result.stderr[-1500:])
     result = subprocess.run(
         command,
         capture_output=True,

@@ -475,6 +475,25 @@ def create_optimized_clip(
             if layout_report is not None and source_caption_band is not None:
                 layout_report["source_caption_band"] = source_caption_band
 
+            # OUTPUT_LANGUAGE: speech in another language gets translated captions.
+            translated_kwargs: Dict[str, Any] = {}
+            if add_subtitles:
+                try:
+                    from .translation import needs_translation, translate_caption_words
+                    transcript_for_lang = load_cached_transcript_data(video_path) or {}
+                    if needs_translation(transcript_for_lang.get("language_code")) and transcript_for_lang.get("words"):
+                        if effective_keep_ranges:
+                            source_words = get_words_for_keep_ranges(
+                                transcript_for_lang, effective_keep_ranges, offsets_kwargs.get("output_offsets")
+                            )
+                        else:
+                            source_words = get_words_in_range(transcript_for_lang, start_time, end_time)
+                        caption_words = translate_caption_words(source_words)
+                        if caption_words is not source_words:
+                            translated_kwargs["caption_words"] = caption_words
+                except Exception as exc:
+                    logger.warning("Caption translation failed; keeping original captions: %s", exc)
+
             burn_ass_path: Optional[Path] = None
             fonts_dir: Optional[Path] = None
             if (add_subtitles or hook_title or point_labels) and build_assemblyai_ass_subtitles(
@@ -496,6 +515,7 @@ def create_optimized_clip(
                 caption_layout_report=layout_report,
                 **offsets_kwargs,
                 **labels_kwargs,
+                **translated_kwargs,
                 # Only stacked interview and facecam openings move the hook title.
                 **(
                     {"hook_center_y": plan_report["hook_center_y"]}

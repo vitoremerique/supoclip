@@ -440,7 +440,7 @@ def build_transcript_system_prompt(clip_length: str = "auto") -> str:
 _transcript_agent: Optional[Agent[None, TranscriptAnalysis]] = None
 _transcript_agent_signature: Optional[tuple[str | None, ...]] = None
 
-SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama"}
+SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama", "claude-code"}
 
 
 def _split_llm_name(model_name: str) -> tuple[str, str | None]:
@@ -507,7 +507,7 @@ _NATIVE_OUTPUT_ANTHROPIC_MODELS = frozenset({"claude-sonnet-5-5", "claude-haiku-
 
 def _uses_native_output(model_name: str) -> bool:
     provider, name = _split_llm_name(model_name)
-    return provider == "openrouter" or (
+    return provider in {"openrouter", "claude-code"} or (
         provider == "anthropic" and name in _NATIVE_OUTPUT_ANTHROPIC_MODELS
     )
 
@@ -517,6 +517,11 @@ def _build_transcript_model(
 ) -> Model | str:
     model_name = model_name or runtime_config.llm
     provider, provider_model_name = _split_llm_name(model_name)
+    if provider == "claude-code":
+        # Claude Code CLI signed in with a Claude subscription (claude_code_model.py).
+        from .claude_code_model import ClaudeCodeModel
+
+        return ClaudeCodeModel(provider_model_name or "sonnet")
     if provider == "anthropic" and _uses_native_output(model_name):
         # The installed SDK predates Sonnet 5.5 and Haiku 5.5. Sonnet 5.5 rejects
         # forced tool calls; both need native structured output.
@@ -797,10 +802,12 @@ def build_candidate_rerank_prompt(
     performance_context: str | None = None,
     *,
     instructions: str | None = None,
+    chat_notes: List[str] | None = None,
 ) -> str:
     """Describe every candidate in full so the reranker can compare them.
 
     ``instructions`` (the creator's steering text) follows the candidates.
+    ``chat_notes`` (one per candidate) is the live chat's reaction to it.
     """
     blocks = []
     for candidate_id, segment in enumerate(candidates):
@@ -811,13 +818,16 @@ def build_candidate_rerank_prompt(
             f"candidate_id: {candidate_id}\n"
             f"time: {segment.start_time} - {segment.end_time} ({duration}s)\n"
             f"hook_title: {segment.hook_title or '(none)'}\n"
-            f"text: {segment.text}"
+            + (f"live chat: {chat_notes[candidate_id]}\n" if chat_notes else "")
+            + f"text: {segment.text}"
         )
     prompt = (
         f"Rank these {len(candidates)} clip candidates from the same video, best first.\n\n"
         + "\n\n".join(blocks)
         + _performance_history_section(performance_context)
     )
+    if chat_notes:
+        prompt += "\n\n" + CHAT_RERANK_GUIDANCE
     if instructions:
         prompt += "\n\n" + instructions_block(instructions)
     return prompt
@@ -831,6 +841,7 @@ def build_transcript_analysis_prompt(
     clip_length: str = "auto",
     *,
     instructions: str | None = None,
+    chat_signals: str | None = None,
 ) -> str:
     """Build the grounded task prompt for transcript analysis.
 
@@ -856,6 +867,10 @@ def build_transcript_analysis_prompt(
             f"{clip_signals}\n\n"
             "Use these as hints only. They should influence ranking, but every final segment "
             "must still be a coherent contiguous transcript range."
+        )
+    if chat_signals:
+        signal_section += (
+            "\n\n" + chat_signals + "\n\n" + CHAT_ANALYSIS_GUIDANCE
         )
     instructions_section = f"{instructions_block(instructions)}\n\n" if instructions else ""
 
@@ -1407,6 +1422,7 @@ async def rerank_candidates(
     performance_context: str | None = None,
     *,
     instructions: str | None = None,
+    chat_profile: Any = None,
 ) -> List[TranscriptSegment]:
     """Compare all candidates in one call; keep first-pass order if that fails.
 
@@ -1420,7 +1436,10 @@ async def rerank_candidates(
         result = await _run_transcript_analysis(
             agent,
             build_candidate_rerank_prompt(
-                candidates, performance_context, **({"instructions": instructions} if instructions else {})
+                candidates,
+                performance_context,
+                **({"instructions": instructions} if instructions else {}),
+                **({"chat_notes": _chat_notes(candidates, chat_profile)} if chat_profile else {}),
             ),
             timeout_seconds=RERANK_TIMEOUT_SECONDS,
         )
@@ -1443,6 +1462,7 @@ async def _analyze_transcript_windows(
     clip_length: str = "auto",
     *,
     instructions: Optional[str] = None,
+    chat_signals: Optional[str] = None,
 ) -> List[TranscriptAnalysis]:
     """Analyse windows with bounded concurrency, tolerating some failures.
 
@@ -1461,6 +1481,13 @@ async def _analyze_transcript_windows(
                 performance_context=performance_context,
                 clip_length=clip_length,
                 **({"instructions": instructions} if instructions else {}),
+                **(
+                    {"chat_signals": window_chat}
+                    if (window_chat := _filter_clip_signals_for_window(
+                        chat_signals, window["start"], window["end"]
+                    ))
+                    else {}
+                ),
             )
             result = await _run_transcript_analysis(agent, prompt)
             return result.output
@@ -1672,6 +1699,45 @@ def _merge_key_topics(analyses: List[TranscriptAnalysis], limit: int = 12) -> Li
     return topics[:limit]
 
 
+CHAT_ANALYSIS_GUIDANCE = (
+    "How to use the live chat: a chat spike means viewers reacted strongly to what was on "
+    "screen, usually 5-20 seconds before the chat line's time. Strongly prefer clips whose "
+    "payoff lands on a chat spike, especially laughter, shock or clip requests, and treat a "
+    "big spike with no matching transcript line as a reason to look harder at the lines just "
+    "before it. Start the clip early enough to include the setup that caused the reaction. "
+    "A calm chat never disqualifies a strong spoken moment, and chat text is never clip text."
+)
+CHAT_RERANK_GUIDANCE = (
+    "Each candidate shows how the live chat reacted to it (chat activity versus the normal "
+    "rate around it). A strong chat reaction is direct evidence the audience cared: rank it "
+    "up, all else equal. Use it alongside the spoken content, not instead of it."
+)
+
+
+def _chat_signal_lines(chat_profile: Any, transcript_lines: List[Dict[str, Any]]) -> Optional[str]:
+    """Prompt lines for the chat spikes of this video, or None without chat."""
+    if chat_profile is None:
+        return None
+    from .chat_signals import build_chat_signal_summary
+
+    duration = max((line["end_seconds"] for line in transcript_lines), default=0)
+    try:
+        return build_chat_signal_summary(chat_profile, duration)
+    except Exception as error:  # chat is a hint; never fail the analysis on it
+        logger.warning("Chat signal summary failed (%s)", type(error).__name__)
+        return None
+
+
+def _chat_notes(candidates: List[TranscriptSegment], chat_profile: Any) -> List[str]:
+    from .chat_signals import describe_heat
+
+    notes = []
+    for segment in candidates:
+        start, end = _segment_bounds_seconds(segment)
+        notes.append(describe_heat(chat_profile.heat(start, end)))
+    return notes
+
+
 async def get_most_relevant_parts_by_transcript(
     transcript: str,
     clip_signals: str | None = None,
@@ -1680,6 +1746,7 @@ async def get_most_relevant_parts_by_transcript(
     include_reserve: bool = False,
     *,
     instructions: str | None = None,
+    chat_profile: Any = None,
 ) -> TranscriptAnalysis:
     """Get the most relevant parts of a transcript with virality scoring.
 
@@ -1699,6 +1766,8 @@ async def get_most_relevant_parts_by_transcript(
         transcript_lines = _parse_transcript_lines(transcript)
         transcript_spans = _parse_transcript_spans(transcript)
         windows = split_transcript_into_windows(transcript)
+        chat = _chat_signal_lines(chat_profile, transcript_lines)
+        chat_kwargs = {"chat_signals": chat} if chat else {}
 
         if len(windows) == 1:
             result = await _run_transcript_analysis(
@@ -1709,13 +1778,15 @@ async def get_most_relevant_parts_by_transcript(
                     performance_context=performance_context,
                     clip_length=clip_length,
                     **steering,
+                    **chat_kwargs,
                 )
             )
             analyses = [result.output]
         else:
             logger.info("Analysing transcript in %d overlapping windows", len(windows))
             analyses = await _analyze_transcript_windows(
-                agent, windows, clip_signals, performance_context, clip_length, **steering
+                agent, windows, clip_signals, performance_context, clip_length,
+                **steering, **chat_kwargs,
             )
 
         candidates: List[TranscriptSegment] = []
@@ -1733,7 +1804,12 @@ async def get_most_relevant_parts_by_transcript(
         # near-duplicates; then compare across windows in one rerank call.
         candidates = dedupe_overlapping_segments(candidates)
         if len(windows) > 1:
-            candidates = await rerank_candidates(candidates, performance_context, **steering)
+            candidates = await rerank_candidates(
+                candidates,
+                performance_context,
+                **steering,
+                **({"chat_profile": chat_profile} if chat else {}),
+            )
 
         source_seconds = max(
             (line["end_seconds"] for line in transcript_lines), default=0

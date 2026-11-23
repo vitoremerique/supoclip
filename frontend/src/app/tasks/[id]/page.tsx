@@ -792,7 +792,9 @@ export default function TaskPage() {
     ? orderedParts(clips)
     : sortable && sortBy === "score"
       ? [...clips].sort((a, b) => (b.virality_score ?? 0) - (a.virality_score ?? 0) || a.clip_order - b.clip_order)
-      : clips;
+      : sortable && sortBy === "timeline"
+        ? [...clips].sort((a, b) => clipStartSeconds(a.start_time) - clipStartSeconds(b.start_time) || a.clip_order - b.clip_order)
+        : clips;
   const focusedClip = focusIndex !== null ? sortedClips[focusIndex] : null;
   const bestScore = SCORED.has(workflow) ? clips.reduce((best, clip) => Math.max(best, clip.virality_score || 0), 0) : 0;
   const totalSeconds = clips.reduce((sum, clip) => sum + (clip.duration || 0), 0);
@@ -1359,4 +1361,13 @@ export default function TaskPage() {
       />
     </main>
   );
+}
+
+/** "MM:SS", "HH:MM:SS" or plain seconds → seconds; unknown values sort last. */
+function clipStartSeconds(value: string | number | null | undefined): number {
+  if (typeof value === "number") return value;
+  if (!value) return Number.POSITIVE_INFINITY;
+  const parts = value.split(":").map(Number);
+  if (parts.some(Number.isNaN)) return Number.POSITIVE_INFINITY;
+  return parts.reduce((total, part) => total * 60 + part, 0);
 }

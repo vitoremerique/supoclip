@@ -349,5 +349,19 @@
       "relaxed": "允许",
       "question": "一个问题"
     }
+  },
+  "liveChat": {
+    "chip": "Live chat",
+    "title": "Analyze the live chat",
+    "body": "Attach the exported chat (.json or .txt). Spikes of laughter, hype and clip requests help the AI find the best clips, together with the transcript.",
+    "file": "Chat file",
+    "choose": "Choose file",
+    "remove": "Remove",
+    "offset": "Where this video starts in the chat",
+    "offsetHint": "0 if the video is the whole stream. For a part, the stream time where it starts (e.g. 2:00:00).",
+    "offsetInvalid": "Use a time like 2:00:00 or seconds.",
+    "formats": "Accepts: TwitchDownloader JSON, yt-dlp live_chat.json, chat-downloader JSON, or .txt with lines \"[0:12:34] user: message\".",
+    "uploading": "Uploading the chat...",
+    "attached": "Chat attached"
   }
 }

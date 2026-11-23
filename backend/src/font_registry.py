@@ -10,6 +10,7 @@ FONTS_DIR = Path(__file__).parent.parent / "fonts"
 USER_FONTS_DIR = FONTS_DIR / "users"
 TTF_NAME_ID_FONT_FAMILY = 1
 TTF_NAME_ID_FULL_NAME = 4
+TTF_NAME_ID_TYPOGRAPHIC_FAMILY = 16
 ASS_UNSAFE_NAME_CHARS = frozenset("(){}\\")
 
 
@@ -281,6 +282,7 @@ def get_font_family_name(font_path: Path) -> str | None:
         num_tables = struct.unpack_from(">H", data, 4)[0]
         name_table_offset = None
         name_table_length = None
+        is_variable = False
         table_record_offset = 12
         for table_index in range(num_tables):
             record_offset = table_record_offset + table_index * 16
@@ -289,10 +291,11 @@ def get_font_family_name(font_path: Path) -> str | None:
             tag, _checksum, table_offset, table_length = struct.unpack_from(
                 ">4sIII", data, record_offset
             )
+            if tag == b"fvar":
+                is_variable = True
             if tag == b"name":
                 name_table_offset = table_offset
                 name_table_length = table_length
-                break
 
         if name_table_offset is None or name_table_length is None:
             return None
@@ -304,6 +307,7 @@ def get_font_family_name(font_path: Path) -> str | None:
         )
         storage_start = name_table_offset + string_offset
         candidates: dict[int, list[str]] = {
+            TTF_NAME_ID_TYPOGRAPHIC_FAMILY: [],
             TTF_NAME_ID_FONT_FAMILY: [],
             TTF_NAME_ID_FULL_NAME: [],
         }
@@ -337,6 +341,15 @@ def get_font_family_name(font_path: Path) -> str | None:
 
         family_names = list(dict.fromkeys(candidates[TTF_NAME_ID_FONT_FAMILY]))
         full_names = [name for name in candidates[TTF_NAME_ID_FULL_NAME] if name]
+        # Variable fonts name their default instance as the legacy family
+        # ("TikTok Sans Light"); the typographic family ("TikTok Sans") lets the
+        # style's bold flag pick the bold instance instead of the thin default.
+        typographic = [
+            name for name in dict.fromkeys(candidates[TTF_NAME_ID_TYPOGRAPHIC_FAMILY])
+            if not ASS_UNSAFE_NAME_CHARS & set(name)
+        ]
+        if is_variable and typographic:
+            return min(typographic, key=len)
         # ASS override tags (\fn<name>) end at "(", "{" or "\", so a family like
         # "THE BOLD FONT (FREE VERSION)" silently falls back to another font.
         # libass also matches full names, so prefer any tag-safe candidate.

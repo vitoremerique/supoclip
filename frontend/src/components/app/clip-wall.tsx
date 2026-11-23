@@ -6,6 +6,7 @@ import { useTranslations } from "next-intl";
 import {
   Check, ChevronLeft, ChevronRight, Download, Flame, Loader2, MessageSquare,
   Play, Scissors, Share2, Star, Trash2, TrendingUp,
+  MessagesSquare,
 } from "lucide-react";
 import { ClipCover, ScoreRing } from "@/components/app/clip-cover";
 import DynamicVideoPlayer from "@/components/dynamic-video-player";
@@ -105,6 +106,7 @@ export function ClipTile({ clip, taskId, busy, best, editable, partTotal, onOpen
   const t = useTranslations("task");
   const title = clipTitle(clip, t);
   const why = clip.workflow_meta?.why;
+  const chatHeat = clip.workflow_meta?.chat;
   return (
     <article className="group @container animate-rise">
       <button
@@ -135,6 +137,14 @@ export function ClipTile({ clip, taskId, busy, best, editable, partTotal, onOpen
           <span className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
             <span className="flex size-12 items-center justify-center rounded-full bg-white/90 text-black shadow-lg"><Play className="ml-0.5 size-5 fill-current" /></span>
           </span>
+          {chatHeat && chatHeat.ratio >= 1.5 && (
+            <span
+              title={chatHeat.samples.join("  ·  ")}
+              className="absolute bottom-2 left-2 inline-flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-white"
+            >
+              <MessagesSquare className="size-3" />x{chatHeat.ratio.toFixed(1)}
+            </span>
+          )}
           <span className="absolute bottom-2 right-2 rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-white">{formatClipDuration(clip.duration)}</span>
         </ClipCover>
       </button>

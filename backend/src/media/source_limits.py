@@ -394,13 +394,69 @@ def build_normalization_command(
     return command
 
 
-def _run_ffmpeg(command: list[str]) -> bool:
+def _source_duration(path: Path) -> float:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        return max(0.0, float(result.stdout.strip() or 0))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0.0
+
+
+def _normalize_timeout(path: Path) -> float:
+    """Three hours, or three times the source length for long streams."""
+    return max(10800.0, _source_duration(path) * 3)
+
+
+def build_gpu_normalization_command(
+    source: Path,
+    destination: Path,
+    *,
+    scale: tuple[int, int] | None,
+    cap_frame_rate: bool,
+    has_audio: bool,
+    copy_audio: bool,
+) -> list[str]:
+    """Same output as `build_normalization_command`, decoded, scaled and encoded on an NVIDIA GPU."""
+    filters: list[str] = []
+    if scale is not None:
+        width, height = scale
+        filters.append(f"scale_cuda={width}:{height}:interp_algo=lanczos:format=nv12")
+    else:
+        filters.append("scale_cuda=format=nv12")
+    if cap_frame_rate:
+        filters.append(f"fps={MAX_OUTPUT_FPS}")
+    command = [
+        "ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-i", str(source), "-map", "0:v:0",
+    ]
+    if has_audio:
+        command += ["-map", "0:a?"]
+    command += [
+        "-vf", ",".join(filters),
+        "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+        "-rc", "vbr", "-cq", "19", "-b:v", "0", "-spatial-aq", "1",
+        "-profile:v", "high",
+    ]
+    if has_audio and copy_audio:
+        command += ["-c:a", "copy"]
+    elif has_audio:
+        command += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        command += ["-an"]
+    command += ["-f", "mp4", str(destination)]
+    return command
+
+
+def _run_ffmpeg(command: list[str], timeout: float = 10800) -> bool:
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=10800,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("Source normalization failed to run: %s", exc)
@@ -459,6 +515,22 @@ def _encode_attempt(
     tonemap: bool,
 ) -> bool:
     temporary.unlink(missing_ok=True)
+    timeout = _normalize_timeout(path)
+    if not tonemap and not square_pixels:
+        from .ffmpeg import nvenc_available
+
+        if nvenc_available():
+            logger.info("Normalizing %s on the GPU (NVDEC + NVENC)", path.name)
+            if _run_ffmpeg(build_gpu_normalization_command(
+                path, temporary,
+                scale=scale,
+                cap_frame_rate=cap_frame_rate,
+                has_audio=has_audio,
+                copy_audio=copy_audio,
+            ), timeout) and temporary.exists() and temporary.stat().st_size > 0:
+                return True
+            logger.warning("GPU normalization failed; retrying on the CPU")
+            temporary.unlink(missing_ok=True)
     wrote = _run_ffmpeg(build_normalization_command(
         path, temporary,
         scale=scale,
@@ -467,7 +539,7 @@ def _encode_attempt(
         copy_audio=copy_audio,
         square_pixels=square_pixels,
         tonemap=tonemap,
-    ))
+    ), timeout)
     return wrote and temporary.exists() and temporary.stat().st_size > 0
 
 

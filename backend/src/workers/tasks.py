@@ -3,6 +3,7 @@ Worker tasks - background jobs processed by arq workers.
 """
 
 import logging
+import os
 from typing import Dict, Any, Optional
 import json
 from arq import Retry
@@ -378,7 +379,8 @@ class WorkerSettings:
 
     # Retry settings
     max_tries = 3  # Retry failed jobs up to 3 times
-    job_timeout = 10800  # 3 hour timeout for video processing
+    # 3 hours by default; a self-hosted box cutting day-long streams raises it.
+    job_timeout = int(os.getenv("VIDEO_JOB_TIMEOUT_SECONDS", "10800"))
 
     # Worker pool settings. Cron jobs live on CronWorkerSettings so they never
     # take one of these slots or pile up behind a long render.

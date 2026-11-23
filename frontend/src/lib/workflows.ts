@@ -266,7 +266,18 @@ export type WorkflowMetaBeat = {
  * `generated_clips.workflow_meta`: `{}` for highlights clips. Shared results
  * only carry `title`, `ends_on`, `points` and `beats`.
  */
+/** How the live chat reacted to a clip (highlights with a chat log attached). */
+export type ClipChatHeat = {
+  /** Peak chat rate versus the normal rate around it. */
+  ratio: number;
+  peak_messages: number;
+  messages: number;
+  reactions: string[];
+  samples: string[];
+};
+
 export type WorkflowMeta = {
+  chat?: ClipChatHeat;
   planned?: boolean;
   ranges?: SourceRange[];
   junction_fades?: number[];

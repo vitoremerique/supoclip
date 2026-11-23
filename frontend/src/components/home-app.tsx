@@ -7,7 +7,9 @@ import { useTranslations } from "next-intl";
 import {
   AlertCircle, ArrowRight, ArrowUp, Captions, CaptionsOff, Check, ChevronDown, Clapperboard, Crop, FileVideo, SlidersHorizontal,
   Info, ListOrdered, Loader2, MessageSquareText, Timer, Paperclip, Sparkles, Target, Upload, Link2, Wand2, X,
+  MessagesSquare,
 } from "lucide-react";
+import { parseChatOffset, uploadChatLog } from "@/lib/chat-log";
 import { CaptionSizeControl } from "@/components/caption-size-control";
 import { ComposerSettings } from "@/components/composer-settings";
 import { OUTPUT_FORMATS, parseCreateSettings, type CreateSettings, type LengthWorkflow, type OutputFormat } from "@/lib/create-settings";
@@ -141,6 +143,7 @@ export default function HomeApp() {
   const [url, setUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
+  const [uploadProgress, setUploadProgress] = useState<{ loaded: number; total: number; startedAt: number } | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -174,6 +177,11 @@ export default function HomeApp() {
   const [pauseThresholdMs, setPauseThresholdMs] = useState("1200");
   const [removeFillerWords, setRemoveFillerWords] = useState(true);
   const [filteredWords, setFilteredWords] = useState("");
+  // Live chat export: its reaction spikes steer clip selection with the transcript.
+  const [chatFile, setChatFile] = useState<File | null>(null);
+  const [chatOffset, setChatOffset] = useState("0");
+  const chatOffsetSeconds = parseChatOffset(chatOffset);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
 
   // What to make. Hidden, and always plain highlights, unless the server enables workflows.
   const router = useRouter();
@@ -765,9 +773,24 @@ export default function HomeApp() {
         : 1200;
       const normalizedFilteredWords = filteredWords.split(",").map((word) => word.trim().toLowerCase()).filter(Boolean);
 
+      let chatLogId: string | null = null;
+      if (chatFile) {
+        if (chatOffsetSeconds === null) throw new Error(t("liveChat.offsetInvalid"));
+        setStatusMessage(t("liveChat.uploading"));
+        chatLogId = (await uploadChatLog(chatFile)).chat_log_id;
+      }
+
       if (sourceType === "upload" && file) {
         setStatusMessage(t("status.uploading"));
-        videoUrl = await uploadVideoFile(file, uploadLimitBytes);
+        const startedAt = Date.now();
+        setUploadProgress({ loaded: 0, total: file.size, startedAt });
+        try {
+          videoUrl = await uploadVideoFile(file, uploadLimitBytes, (loaded, total) => {
+            setUploadProgress({ loaded, total, startedAt });
+          });
+        } finally {
+          setUploadProgress(null);
+        }
       }
 
       const request: Record<string, unknown> = {
@@ -794,6 +817,10 @@ export default function HomeApp() {
       if (advancedCount > 0) options.advanced = advancedChanges;
       if (Object.keys(options).length > 0) request.workflow_options = options;
       if (sentInstructions) request.instructions = sentInstructions;
+      if (chatLogId) {
+        request.chat_log_id = chatLogId;
+        request.chat_offset_seconds = chatOffsetSeconds ?? 0;
+      }
 
       setStatusMessage(sourceType === "youtube" ? t("status.checkingLength") : t("status.starting"));
       const startResponse = await fetch("/api/tasks/create", {
@@ -1089,6 +1116,29 @@ export default function HomeApp() {
                 </Chip>
               )}
 
+              <input
+                ref={chatInputRef}
+                type="file"
+                accept=".json,.jsonl,.txt,.log,application/json,text/plain"
+                className="hidden"
+                onChange={(e) => { setChatFile(e.target.files?.[0] ?? null); e.target.value = ""; }}
+              />
+              <Chip
+                onClick={() => chatInputRef.current?.click()}
+                disabled={controlsDisabled}
+                active={Boolean(chatFile)}
+                aria-label={t("liveChat.title")}
+                title={chatFile ? chatFile.name : t("liveChat.body")}
+              >
+                <MessagesSquare className="size-3.5" />
+                <span className="hidden max-w-40 truncate sm:inline">{chatFile ? chatFile.name : t("liveChat.chip")}</span>
+              </Chip>
+              {chatFile && (
+                <Chip onClick={() => setChatFile(null)} disabled={controlsDisabled} aria-label={t("liveChat.remove")} title={t("liveChat.remove")}>
+                  <X className="size-3.5" />
+                </Chip>
+              )}
+
               {instructionsOffered && (
                 // Icon-only like B-roll, so the desktop composer stays on one row.
                 <Chip
@@ -1303,6 +1353,48 @@ export default function HomeApp() {
                   </div>
                     </div>
                   ) },
+                  { id: "live-chat", label: t("liveChat.chip"), icon: <MessagesSquare />, value: chatFile ? t("liveChat.attached") : t("composerSettings.off"), content: (
+                    <div className="space-y-4">
+                      <div>
+                        <p className="text-sm font-medium">{t("liveChat.title")}</p>
+                        <p className="text-xs text-muted-foreground">{t("liveChat.body")}</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label htmlFor="live-chat-file" className="text-xs font-medium text-muted-foreground">{t("liveChat.file")}</label>
+                        <div className="flex items-center gap-2">
+                          <Input
+                            id="live-chat-file"
+                            type="file"
+                            accept=".json,.jsonl,.txt,.log,application/json,text/plain"
+                            onChange={(e) => setChatFile(e.target.files?.[0] ?? null)}
+                            disabled={controlsDisabled}
+                            className="h-9"
+                          />
+                          {chatFile && (
+                            <Button type="button" variant="ghost" size="sm" onClick={() => setChatFile(null)} disabled={controlsDisabled}>
+                              {t("liveChat.remove")}
+                            </Button>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground">{t("liveChat.formats")}</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label htmlFor="live-chat-offset" className="text-xs font-medium text-muted-foreground">{t("liveChat.offset")}</label>
+                        <Input
+                          id="live-chat-offset"
+                          value={chatOffset}
+                          onChange={(e) => setChatOffset(e.target.value)}
+                          placeholder="0:00:00"
+                          disabled={controlsDisabled || !chatFile}
+                          aria-invalid={chatOffsetSeconds === null}
+                          className="h-8 w-32"
+                        />
+                        <p className={cn("text-xs", chatOffsetSeconds === null ? "text-destructive" : "text-muted-foreground")}>
+                          {chatOffsetSeconds === null ? t("liveChat.offsetInvalid") : t("liveChat.offsetHint")}
+                        </p>
+                      </div>
+                    </div>
+                  ) },
                   ...(brollAvailable ? [{ id: "broll", label: t("broll"), icon: <Clapperboard />, value: includeBroll ? t("composerSettings.on") : t("composerSettings.off"), content: (
                     <div className="flex items-center justify-between gap-4">
                       <div>
@@ -1369,7 +1461,11 @@ export default function HomeApp() {
             </div>
           </form>
 
-          {isLoading && statusMessage && <p role="status" className="mt-3 text-center text-sm text-muted-foreground sm:hidden">{statusMessage}</p>}
+          {uploadProgress ? (
+            <UploadProgressBar {...uploadProgress} label={statusMessage} />
+          ) : (
+            isLoading && statusMessage && <p role="status" className="mt-3 text-center text-sm text-muted-foreground sm:hidden">{statusMessage}</p>
+          )}
 
           {error && (
             <Alert className="mt-4 border-red-200 bg-red-50 dark:border-red-900/60 dark:bg-red-950/40">
@@ -1419,6 +1515,37 @@ export default function HomeApp() {
 }
 
 /** Ties a detail row to the source above it, like a branch: down from the source icon, then across to this row's icon. */
+function formatRemaining(seconds: number) {
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.floor(minutes / 60)} h ${String(minutes % 60).padStart(2, "0")} min`;
+}
+
+/** How much of the video has reached the server, with speed and time left. */
+function UploadProgressBar({ loaded, total, startedAt, label }: { loaded: number; total: number; startedAt: number; label: string }) {
+  const fraction = total > 0 ? Math.min(1, loaded / total) : 0;
+  const percent = Math.floor(fraction * 1000) / 10;
+  const elapsed = (Date.now() - startedAt) / 1000;
+  const speed = elapsed > 2 && loaded > 0 ? loaded / elapsed : 0;
+  const remaining = speed > 0 ? (total - loaded) / speed : null;
+  return (
+    <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(percent)} aria-label={label} className="mt-3 space-y-1.5">
+      <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
+        <span className="truncate">{label} <span className="font-medium tabular-nums text-foreground">{percent.toFixed(1)}%</span></span>
+        <span className="shrink-0 tabular-nums">
+          {formatBytes(loaded)} / {formatBytes(total)}
+          {speed > 0 && ` · ${(speed / 1e6).toFixed(0)} MB/s`}
+          {fraction < 1 && remaining !== null && ` · ~${formatRemaining(remaining)}`}
+        </span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-muted">
+        <div className="h-full rounded-full bg-brand transition-[width] duration-300" style={{ width: `${fraction * 100}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function SourceBranch({ continues = false }: { continues?: boolean }) {
   return (
     <span aria-hidden className="pointer-events-none absolute inset-y-0 left-[2.125rem] sm:left-[2.375rem]">
@@ -1447,7 +1574,7 @@ function Chip({ active, className, children, ...props }: React.ComponentProps<"b
 function CaptionPreview({ thumbnail, fontFamily, fontSize, color }: { thumbnail: string | null; fontFamily: string; fontSize: number; color: string }) {
   const t = useTranslations("home");
   return (
-    <div className="relative mx-auto aspect-[9/16] w-full overflow-hidden rounded-xl bg-stone-800 shadow-inner">
+    <div className="relative mx-auto aspect-[9/16] w-full overflow-hidden rounded-xl bg-stone-800 shadow-inner" style={{ containerType: "inline-size" }}>
       {thumbnail ? (
         <div className="absolute inset-0 scale-110 bg-cover bg-center blur-[2px]" style={{ backgroundImage: `url(${thumbnail})` }} />
       ) : (
@@ -1460,7 +1587,8 @@ function CaptionPreview({ thumbnail, fontFamily, fontSize, color }: { thumbnail:
         style={{
           color,
           fontFamily: `'${fontFamily}', system-ui, sans-serif`,
-          fontSize: `${Math.max(Math.min(fontSize * 0.5, 18), 10)}px`,
+          // Same scale as the render (captions.get_scaled_font_size on a 1080-wide clip).
+          fontSize: `${(Math.max(26, Math.min(132, Math.round(fontSize * 1080 / 560))) / 1080) * 100}cqw`,
           textShadow: "0 2px 6px rgba(0,0,0,0.8), 0 0 2px rgba(0,0,0,0.9)",
         }}
       >

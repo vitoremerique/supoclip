@@ -202,6 +202,7 @@ PostgreSQL 15. Schema in `init.sql`. Mixed naming conventions:
 - `GET /fonts`, `GET /transitions`, `GET /caption-templates`, `GET /broll/status`
 - `POST /upload` — Upload video file
 - `GET /clips/{filename}` — Serve generated clips
+- `POST /chat-logs` — Upload a live chat export (TwitchDownloader / yt-dlp `live_chat.json` / chat-downloader JSON or timestamped `.txt`); stored as 5-second activity buckets (`chat_logs`, `chat_signals.py`). `POST /tasks/` with `chat_log_id` + `chat_offset_seconds` feeds the chat spikes into window analysis and rerank (bypasses the shared analysis cache); each clip gets `workflow_meta.chat` (shown as a chat badge)
 
 **Feedback:**
 - `POST /feedback` — Store a bug/feature/general/sales/cancellation message (the only way one is created); webhooks are fanned out from an outbox

@@ -55,6 +55,7 @@ from ...workers.job_queue import JobQueue
 from ..pool_timeout import pool_busy
 from ...workers.progress import ProgressTracker
 from ...config import get_config
+from ...repositories.chat_log_repository import ChatLogRepository
 from ...youtube_utils import async_get_youtube_video_info, canonical_youtube_url, has_verified_duration
 from ...youtube_proxy import YouTubeAgeRestrictedError, YouTubeGeoRestrictedError
 from ...stream_source import (
@@ -326,6 +327,21 @@ async def _get_user_id_from_headers(request: Request, db: AsyncSession) -> str:
     """Resolve the authenticated user ID from an API key or signed frontend headers."""
     config = get_config()
     return await resolve_authenticated_user_id(request, db, config)
+
+
+async def _chat_settings_for_task(db: AsyncSession, user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """``chat_log_id`` + ``chat_offset_seconds`` for source_metadata, validated."""
+    chat_log_id = data.get("chat_log_id")
+    if not chat_log_id:
+        return {}
+    if not isinstance(chat_log_id, str) or not await ChatLogRepository.exists_for_user(
+        db, chat_log_id, user_id
+    ):
+        raise HTTPException(status_code=422, detail="Chat log not found")
+    offset = data.get("chat_offset_seconds") or 0
+    if isinstance(offset, bool) or not isinstance(offset, (int, float)) or abs(offset) > 7 * 86400:
+        raise HTTPException(status_code=422, detail="chat_offset_seconds must be a number of seconds")
+    return {"chat_log_id": chat_log_id, "chat_offset_seconds": float(offset)}
 
 
 async def _load_task_source_metadata(task_id: str, db: AsyncSession | None = None) -> Dict[str, Any]:
@@ -702,6 +718,7 @@ async def _create_task(request: Request, db: AsyncSession, attempt: SourceAttemp
     cleanup_settings = new_task_cleanup_settings(data)
     if not raw_source or not raw_source.get("url"):
         raise HTTPException(status_code=400, detail="Source URL is required")
+    chat_settings = await _chat_settings_for_task(db, user_id, data)
 
     upload_options = {
         "url": raw_source["url"],
@@ -715,6 +732,7 @@ async def _create_task(request: Request, db: AsyncSession, attempt: SourceAttemp
         "add_subtitles": add_subtitles,
         "clip_length": clip_length,
         "cleanup_settings": cleanup_settings,
+        **chat_settings,
     }
     if not workflow_spec.legacy:
         # Plain highlights keep their existing key. The key is a hash, so topic
@@ -854,6 +872,7 @@ async def _create_task(request: Request, db: AsyncSession, attempt: SourceAttemp
                             "enqueued_at": datetime.now(timezone.utc).isoformat(),
                             **({"source_key": source_key} if source_key else {}),
                             **_stream_resolution_metadata(stream_metadata),
+                            **chat_settings,
                         },
                         source_url=raw_source["url"],
                         source_type=source_type,

@@ -47,6 +47,8 @@ from .task_completion_email_service import (
 from ..config import Config, get_config
 from ..youtube_utils import cleanup_downloaded_files, extract_video_id
 from ..youtube_proxy import YouTubeGeoRestrictedError, is_age_restricted_error
+from ..chat_signals import ChatProfile, slice_chat_buckets
+from ..repositories.chat_log_repository import ChatLogRepository
 from ..youtube_source import load_time_map, localize_segment, restore_clip_timeline, transcript_source_for
 from ..clip_cleanup import normalize_clip_cleanup_settings
 from ..clip_duration import clip_duration, validate_clip_length
@@ -442,6 +444,41 @@ class TaskService(ClipEditingMixin):
         logger.info(f"Created task {task_id} for user {user_id}")
         return task_id
 
+    async def _load_chat_profile(self, task_row: Dict[str, Any], user_id: Optional[str]) -> Any:
+        """The live chat of this task's video, or None (best effort)."""
+        metadata = task_row.get("source_metadata")
+        if not metadata and task_row.get("id"):
+            # get_task_by_id does not select source_metadata.
+            metadata = await self.task_repo.load_source_metadata(self.db, str(task_row["id"]))
+        metadata = metadata or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except ValueError:
+                metadata = {}
+        chat_log_id = metadata.get("chat_log_id")
+        if not chat_log_id or not user_id:
+            return None
+        try:
+            buckets = await ChatLogRepository.get_buckets(self.db, chat_log_id, user_id)
+            if not buckets:
+                return None
+            duration = task_row.get("source_duration_seconds")
+            sliced = slice_chat_buckets(
+                buckets,
+                float(metadata.get("chat_offset_seconds") or 0),
+                float(duration) if duration else None,
+            )
+            profile = ChatProfile(sliced)
+        except Exception as exc:
+            logger.warning("Live chat unavailable for this task: %s", type(exc).__name__)
+            return None
+        if not profile.usable:
+            logger.info("Live chat has too few messages in this video's range; ignoring it")
+            return None
+        logger.info("Using live chat: %d messages in this video's range", profile.message_count)
+        return profile
+
     async def _load_performance_context(self, user_id: Optional[str]) -> Optional[str]:
         """Build the creator's performance summary for the AI prompt (best effort)."""
         if not user_id:
@@ -581,7 +618,10 @@ class TaskService(ClipEditingMixin):
                 if spec.uses_performance_context
                 else None
             )
-            if performance_context:
+            # Live chat spikes steer this task's selection, so it neither
+            # reuses nor writes the shared analysis cache.
+            chat_profile = await self._load_chat_profile(task_row, user_id)
+            if performance_context or chat_profile is not None:
                 cached_analysis_json = None
             input_key = checkpoint_input_key(url, source_type, processing_mode, clip_length, self.config)
             checkpoint = await self.checkpoint_repo.get(self.db, task_id, input_key)
@@ -685,6 +725,7 @@ class TaskService(ClipEditingMixin):
                 checkpoint=checkpoint,
                 checkpoint_callback=save_checkpoint,
                 **workflow_kwargs,
+                **({"chat_profile": chat_profile} if chat_profile is not None else {}),
             )
             stage_timings["pipeline_seconds"] = round(
                 perf_counter() - pipeline_start, 3
@@ -723,11 +764,11 @@ class TaskService(ClipEditingMixin):
                 transcript_text=result.get("transcript"),
                 analysis_json=(
                     result.get("analysis_json")
-                    if not performance_context and analysis_cache_key == cache_key
+                    if not performance_context and chat_profile is None and analysis_cache_key == cache_key
                     else None
                 ),
             )
-            if not performance_context and analysis_cache_key != cache_key:
+            if not performance_context and chat_profile is None and analysis_cache_key != cache_key:
                 await self.cache_repo.upsert_cache(
                     self.db,
                     cache_key=analysis_cache_key,
@@ -738,6 +779,13 @@ class TaskService(ClipEditingMixin):
 
             video_path = Path(result["video_path"])
             time_map = await run_in_thread(load_time_map, video_path)
+            if output_format == "vertical_facecam":
+                try:
+                    from ..media.reframing import prime_stream_facecam
+
+                    await run_in_thread(prime_stream_facecam, video_path)
+                except Exception as exc:
+                    logger.warning("Stream webcam detection failed: %s", exc)
             total_clips = len(segments_to_render)
             clips_output_dir = Path(self.config.temp_dir) / "clips"
             clips_output_dir.mkdir(parents=True, exist_ok=True)
@@ -871,6 +919,8 @@ class TaskService(ClipEditingMixin):
                         "part_number": segment.get("part_number"),
                         "workflow_meta": meta or None,
                     }
+                elif segment.get("chat"):
+                    workflow_fields = {"workflow_meta": {"chat": segment["chat"]}}
 
                 async with self._processing_transaction(task_id):
                     await check_cancelled()

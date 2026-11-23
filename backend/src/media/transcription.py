@@ -4,11 +4,13 @@ from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
+import subprocess
 from pathlib import Path
 import assemblyai as aai
 from ..config import get_config
 import httpx
 import json
+import os
 import re
 import time
 from .common import (
@@ -30,6 +32,17 @@ from .ffmpeg import (
     select_audio_stream_index,
 )
 
+
+
+def _media_duration(path: Path) -> float:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        return float(out or 0)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0.0
 
 def _prepare_audio_for_transcription(video_path: Path) -> Path:
     """Extract a compact audio-only file for transcription."""
@@ -55,7 +68,11 @@ def _prepare_audio_for_transcription(video_path: Path) -> Path:
         str(audio_path),
     ]
     try:
-        result = run_ffmpeg_command(command, timeout=900)
+        # About 30 s per hour of source; day-long streams need far more than 15 min.
+        result = run_ffmpeg_command(command, timeout=max(900, int(_media_duration(video_path) * 0.25)))
+    except subprocess.TimeoutExpired:
+        logger.warning("Audio extraction timed out; falling back to source video for transcription")
+        return video_path
     except FileNotFoundError:
         logger.warning(
             "ffmpeg is not available; falling back to source video for transcription"
@@ -174,16 +191,72 @@ def _assemblyai_speech_models_value(speech_model: str) -> List[str]:
     return ["universal-3-5-pro", "universal-2"]
 
 
-def _get_whisper_model(model_name: str = "base"):
-    """Load and cache a Whisper model by name."""
+def _whisper_device() -> str:
+    """cuda when a GPU is visible (WHISPER_DEVICE=cpu forces the CPU)."""
+    import os
+
+    wanted = os.getenv("WHISPER_DEVICE", "auto").strip().lower()
+    if wanted == "cpu":
+        return "cpu"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _free_gpu_for_whisper() -> None:
+    """Ask a local Ollama to unload its models so Whisper fits in VRAM.
+
+    The analysis right after transcription loads the model again by itself.
+    """
+    try:
+        base = get_config().resolve_ollama_base_url().rstrip("/")
+        base = re.sub(r"/v1$", "", base)
+        with httpx.Client(timeout=10) as client:
+            loaded = client.get(f"{base}/api/ps").json().get("models") or []
+            for model in loaded:
+                name = model.get("name") or model.get("model")
+                if name:
+                    client.post(f"{base}/api/generate", json={"model": name, "keep_alive": 0})
+                    logger.info("Unloaded Ollama model %s to free the GPU for Whisper", name)
+        if loaded:
+            time.sleep(2)
+    except Exception as exc:
+        logger.info("Could not ask Ollama to free the GPU: %s", exc)
+
+
+def _release_whisper_gpu() -> None:
+    """Drop GPU-resident Whisper models so the LLM gets the VRAM back."""
+    for key in [k for k in _WHISPER_MODEL_CACHE if k.endswith("@cuda")]:
+        _WHISPER_MODEL_CACHE.pop(key, None)
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _get_whisper_model(model_name: str = "base", device: Optional[str] = None):
+    """Load and cache a Whisper model by name and device."""
     if not _WHISPER_AVAILABLE:
         raise RuntimeError(
             "Whisper is not installed. Install it with: uv add openai-whisper"
         )
-    if model_name not in _WHISPER_MODEL_CACHE:
-        logger.info("Loading Whisper model: %s", model_name)
-        _WHISPER_MODEL_CACHE[model_name] = _whisper.load_model(model_name)
-    return _WHISPER_MODEL_CACHE[model_name]
+    device = device or "cpu"
+    key = f"{model_name}@{device}"
+    if key not in _WHISPER_MODEL_CACHE:
+        logger.info("Loading Whisper model: %s on %s", model_name, device)
+        _WHISPER_MODEL_CACHE[key] = _whisper.load_model(model_name, device=device)
+    return _WHISPER_MODEL_CACHE[key]
 
 
 def transcribe_with_whisper(
@@ -192,17 +265,146 @@ def transcribe_with_whisper(
     """Transcribe video using local Whisper with word-level timestamps.
 
     ``language`` None lets Whisper detect it; AssemblyAI-style codes such as
-    ``en_us`` are reduced to the ISO 639-1 base Whisper expects.
+    ``en_us`` are reduced to the ISO 639-1 base Whisper expects. Runs on the
+    GPU when one is visible (falling back to the CPU if it runs out of
+    memory) and gives the VRAM back afterwards.
     """
     audio_path = _prepare_audio_for_transcription(video_path)
-    model = _get_whisper_model(model_name)
     whisper_language = language.split("_", 1)[0] if language else None
+
+    duration = _media_duration(audio_path)
+    if duration > WHISPER_CHUNK_SECONDS * 1.5:
+        # Whisper decodes the whole file into RAM (~14 GB for a day-long
+        # stream), which gets the worker OOM-killed. Transcribe in chunks.
+        try:
+            return _transcribe_whisper_chunked(audio_path, duration, model_name, whisper_language)
+        finally:
+            _release_whisper_gpu()
+    try:
+        return _whisper_transcribe_file(audio_path, model_name, whisper_language)
+    finally:
+        _release_whisper_gpu()
+
+
+WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "1200"))
+
+
+def _whisper_transcribe_file(
+    audio_path: Path, model_name: str, whisper_language: Optional[str]
+) -> Dict[str, Any]:
+    """Run Whisper on one file, on the GPU when possible (CPU fallback)."""
+    if _whisper_device() == "cuda":
+        if not any(k.endswith("@cuda") for k in _WHISPER_MODEL_CACHE):
+            _free_gpu_for_whisper()
+        try:
+            model = _get_whisper_model(model_name, "cuda")
+            logger.info(
+                "Starting Whisper transcription with model: %s on GPU (language: %s)",
+                model_name,
+                whisper_language or "auto",
+            )
+            return model.transcribe(
+                str(audio_path),
+                word_timestamps=True,
+                language=whisper_language,
+                # GTX 16xx cards produce empty or garbled text in fp16.
+                fp16=os.getenv("WHISPER_FP16", "false").strip().lower() == "true",
+            )
+        except Exception as exc:
+            if "out of memory" not in str(exc).lower() and "cuda" not in str(exc).lower():
+                raise
+            logger.warning("Whisper on GPU failed (%s); transcribing on the CPU", exc)
+            _release_whisper_gpu()
+    model = _get_whisper_model(model_name, "cpu")
     logger.info(
-        "Starting Whisper transcription with model: %s (language: %s)",
+        "Starting Whisper transcription with model: %s on CPU (language: %s)",
         model_name,
         whisper_language or "auto",
     )
     return model.transcribe(str(audio_path), word_timestamps=True, language=whisper_language)
+
+
+def _transcribe_whisper_chunked(
+    audio_path: Path, duration: float, model_name: str, whisper_language: Optional[str]
+) -> Dict[str, Any]:
+    """Transcribe a long file chunk by chunk with bounded memory.
+
+    Each chunk's result is saved next to the audio, so a worker restart
+    resumes from the last finished chunk instead of starting over.
+    """
+    work_dir = audio_path.with_name(f"{audio_path.stem}.chunks")
+    work_dir.mkdir(exist_ok=True)
+    total = int(duration // WHISPER_CHUNK_SECONDS) + (1 if duration % WHISPER_CHUNK_SECONDS else 0)
+    segments: List[Dict[str, Any]] = []
+    texts: List[str] = []
+    detected_language = whisper_language
+
+    for index in range(total):
+        offset = index * WHISPER_CHUNK_SECONDS
+        result_path = work_dir / f"{index:05d}.json"
+        result: Optional[Dict[str, Any]] = None
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                result = None
+        if result is None:
+            chunk_path = work_dir / f"{index:05d}.wav"
+            run_ffmpeg_command(
+                [
+                    "ffmpeg", "-y", "-ss", str(offset), "-t", str(WHISPER_CHUNK_SECONDS),
+                    "-i", str(audio_path), "-ac", "1", "-ar", "16000", str(chunk_path),
+                ],
+                timeout=600,
+            )
+            try:
+                raw = _whisper_transcribe_file(chunk_path, model_name, detected_language)
+            finally:
+                chunk_path.unlink(missing_ok=True)
+            result = {
+                "text": raw.get("text", ""),
+                "language": raw.get("language"),
+                "segments": [
+                    {
+                        "start": s.get("start", 0.0),
+                        "end": s.get("end", 0.0),
+                        "text": s.get("text", ""),
+                        "words": [
+                            {
+                                "word": w.get("word", ""),
+                                "start": w.get("start", 0.0),
+                                "end": w.get("end", 0.0),
+                                "probability": w.get("probability"),
+                            }
+                            for w in (s.get("words") or [])
+                        ],
+                    }
+                    for s in (raw.get("segments") or [])
+                ],
+            }
+            tmp = result_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(result), encoding="utf-8")
+            tmp.replace(result_path)
+        logger.info("Whisper chunk %d/%d done (offset %ds)", index + 1, total, offset)
+
+        # Lock the language after the first chunk so later ones don't drift.
+        detected_language = detected_language or result.get("language")
+        texts.append((result.get("text") or "").strip())
+        for seg in result.get("segments") or []:
+            segments.append(
+                {
+                    "id": len(segments),
+                    "start": seg["start"] + offset,
+                    "end": seg["end"] + offset,
+                    "text": seg.get("text", ""),
+                    "words": [
+                        {**w, "start": w["start"] + offset, "end": w["end"] + offset}
+                        for w in seg.get("words") or []
+                    ],
+                }
+            )
+
+    return {"text": " ".join(t for t in texts if t), "segments": segments, "language": detected_language}
 
 
 def _whisper_result_to_transcript_data(whisper_result: Dict[str, Any]) -> Dict[str, Any]:
