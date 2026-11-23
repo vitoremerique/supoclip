@@ -10,6 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FeedbackButton } from "@/components/feedback-button";
 import { PostHogIdentity } from "@/components/posthog-identity";
+import { LocalAutoLogin } from "@/components/local-auto-login";
 import { ThemeProvider } from "@/components/theme-provider";
 import { intlLocale } from "@/i18n/config";
 import { APP_STORE_ID, COMPANY_NAME, getSiteUrl } from "@/lib/site";
@@ -137,6 +138,7 @@ export default async function RootLayout({
             <TooltipProvider>
               {children}
               <DataFastIdentity />
+              <LocalAutoLogin />
               <PostHogIdentity />
               <AttributionTracker />
               <FeedbackButton />

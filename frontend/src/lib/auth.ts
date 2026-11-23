@@ -5,6 +5,7 @@ import { nextCookies } from "better-auth/next-js";
 import { getAuthTrustedOrigins } from "@/lib/auth-origins";
 import { prepareAccountDeletion } from "@/server/account-deletion";
 import { fetchBackend } from "@/server/backend-api";
+import { localAutoLogin } from "@/lib/local-auto-login";
 
 const disableSignUp = ["1", "true", "yes"].includes(
   (process.env.DISABLE_SIGN_UP ?? "").toLowerCase()
@@ -84,6 +85,7 @@ export const auth = betterAuth({
   },
   plugins: [
     nextCookies(), // Enable Next.js cookie handling
+    localAutoLogin(),
   ],
 });
 
